@@ -2796,6 +2796,13 @@ if __name__ == '__main__':
                                           subtitle_band=source_subtitle_band)
                     if success:
                         print(f"   🎞️ Clip {i+1} framed")
+                    # Background music goes into the canonical clip, so the hook,
+                    # captions and later re-renders all carry it.
+                    if success and os.environ.get("BG_MUSIC_PATH"):
+                        import background_music
+                        if background_music.mix_into(clip_final_path, os.environ["BG_MUSIC_PATH"],
+                                                     os.environ.get("BG_MUSIC_VOLUME")):
+                            print(f"   🎵 Background music mixed into clip {i+1}")
                     deliver_path = clip_final_path
                     # Which stretches were stacked (SPLIT): captions go on the
                     # seam there, and /api/subtitle needs it again later.

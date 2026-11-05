@@ -3628,6 +3628,8 @@ async def process_endpoint(
     max_minutes: Optional[str] = Form(None),
     source_start: Optional[str] = Form(None),
     source_end: Optional[str] = Form(None),
+    music: Optional[UploadFile] = File(None),
+    music_volume: Optional[str] = Form(None),
 ):
     api_key = await resolve_gemini(request)
     if not api_key and not (llm_backend.active() and not BILLING_ENABLED):
@@ -3752,6 +3754,26 @@ async def process_endpoint(
     if groq_key:
         env["GROQ_API_KEY"] = groq_key
         env["TRANSCRIBE_BACKEND"] = "groq"
+    # Optional background music, mixed under every clip of this job.
+    if music is not None and music.filename:
+        import background_music
+        ext = os.path.splitext(music.filename)[1].lower()
+        if ext not in background_music.ALLOWED_EXTENSIONS:
+            raise HTTPException(status_code=400, detail="Music must be one of: "
+                                + ", ".join(background_music.ALLOWED_EXTENSIONS))
+        music_path = os.path.abspath(os.path.join(job_output_dir, f"background_music{ext}"))
+        size, limit = 0, 50 * 1024 * 1024
+        with open(music_path, "wb") as fh:
+            while chunk := await music.read(1024 * 1024):
+                size += len(chunk)
+                if size > limit:
+                    fh.close()
+                    os.remove(music_path)
+                    raise HTTPException(status_code=400, detail="Music file is over 50 MB.")
+                fh.write(chunk)
+        env["BG_MUSIC_PATH"] = music_path
+        env["BG_MUSIC_VOLUME"] = str(background_music.clamp_volume(music_volume))
+        print(f"[music] job={job_id} volume={env['BG_MUSIC_VOLUME']}")
     # The stdio fix above only covers this process. main.py prints an emoji on
     # its first line and configures nothing, so on a cp1252 console the child
     # still dies before it renders anything -- the server starts and every job

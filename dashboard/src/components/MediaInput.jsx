@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Link2, Upload, FileVideo, X, Info, Loader2, ChevronDown } from 'lucide-react';
+import { Link2, Upload, FileVideo, X, Info, Loader2, ChevronDown, Music } from 'lucide-react';
 import { track } from '../lib/analytics';
 import { getApiUrl } from '../config';
 import SourceCost from './SourceCost';
@@ -46,6 +46,9 @@ export default function MediaInput({ onProcess, isProcessing }) {
     // Advanced generation controls — empty string means "let the AI decide",
     // which keeps the default pipeline behavior untouched.
     const [showAdvanced, setShowAdvanced] = useState(false);
+    // Optional background music mixed under every clip (ducked under speech).
+    const [musicFile, setMusicFile] = useState(null);
+    const [musicVolume, setMusicVolume] = useState(15);
     const [targetClips, setTargetClips] = useState('');
     const [clipMinSeconds, setClipMinSeconds] = useState('');
     const [clipMaxSeconds, setClipMaxSeconds] = useState('');
@@ -129,6 +132,8 @@ export default function MediaInput({ onProcess, isProcessing }) {
             layout,
             sourceStart: range ? Math.round(range.start) : null,
             sourceEnd: range ? Math.round(range.end) : null,
+            musicFile,
+            musicVolume: musicFile ? musicVolume : null,
         };
         try {
             localStorage.setItem('os_auto_hook', autoHook ? '1' : '0');
@@ -258,6 +263,56 @@ export default function MediaInput({ onProcess, isProcessing }) {
                         )}
                     </div>
                 )}
+
+                {/* Background music — same card as the video, optional */}
+                <div className="mt-4 p-3 border border-rule rounded-input">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="flex items-center gap-2 text-xs text-ink2 lowercase">
+                            <Music size={14} className="text-brass" /> background music
+                            <span className="text-muted">(optional)</span>
+                        </span>
+                        {musicFile ? (
+                            <span className="flex items-center gap-2 min-w-0 text-xs text-ok">
+                                <span className="truncate max-w-[180px] sm:max-w-[260px]">{musicFile.name}</span>
+                                <button
+                                    type="button"
+                                    onClick={() => setMusicFile(null)}
+                                    aria-label="Remove music"
+                                    className="p-1 text-muted hover:text-ink hover:bg-paper3 rounded-full transition-colors"
+                                >
+                                    <X size={14} />
+                                </button>
+                            </span>
+                        ) : (
+                            <label className="btn-quiet py-1.5 px-3 text-xs cursor-pointer">
+                                choose audio
+                                <input
+                                    type="file"
+                                    accept=".mp3,.m4a,.aac,.wav,.ogg,.flac,audio/*"
+                                    onChange={(e) => setMusicFile(e.target.files?.[0] || null)}
+                                    className="hidden"
+                                />
+                            </label>
+                        )}
+                    </div>
+                    {musicFile && (
+                        <div className="mt-3 flex items-center gap-3">
+                            <span className="text-[11px] text-muted whitespace-nowrap">volume</span>
+                            <input
+                                type="range" min="5" max="50" step="1"
+                                value={musicVolume}
+                                onChange={(e) => setMusicVolume(Number(e.target.value))}
+                                className="flex-1 accent-[color:var(--color-accent)]"
+                                aria-label="Music volume"
+                            />
+                            <span className="font-mono text-xs text-ink2 w-10 text-right">{musicVolume}%</span>
+                        </div>
+                    )}
+                    <p className="mt-2 text-[11px] leading-relaxed text-muted">
+                        Loops under every clip, fades in and out, and dips while someone is talking.
+                        Use royalty-free music: platforms mute or remove videos with copyrighted tracks.
+                    </p>
+                </div>
 
                 <SourceCost
                     mode={mode}

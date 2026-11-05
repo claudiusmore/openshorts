@@ -1157,7 +1157,8 @@ function App() {
         source_end: data.sourceEnd ?? null,
       };
 
-      if (data.type === 'url') {
+      // A music file cannot ride JSON: a link with music goes multipart too.
+      if (data.type === 'url' && !data.musicFile) {
         headers['Content-Type'] = 'application/json';
         body = JSON.stringify({
           url: data.payload,
@@ -1178,11 +1179,20 @@ function App() {
         });
       } else {
         const formData = new FormData();
-        formData.append('file', data.payload);
+        if (data.type === 'url') {
+          formData.append('url', data.payload);
+          if (forceLowQuality) formData.append('force_low_quality', 'true');
+        } else {
+          formData.append('file', data.payload);
+        }
         formData.append('acknowledged', data.acknowledged ? 'true' : 'false');
         formData.append('output_format', data.outputFormat || 'auto');
         for (const [k, v] of Object.entries(advanced)) {
           if (v != null) formData.append(k, v);
+        }
+        if (data.musicFile) {
+          formData.append('music', data.musicFile);
+          formData.append('music_volume', String(data.musicVolume ?? 15));
         }
         body = formData;
       }
