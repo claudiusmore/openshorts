@@ -25,12 +25,14 @@ import LoginModal from './components/LoginModal';
 import TrialGate from './components/TrialGate';
 import AdvancedBanner from './components/AdvancedBanner';
 import HistoryTab from './components/HistoryTab';
+import ProjectsTab from './components/ProjectsTab';
 import AutopilotTab from './components/AutopilotTab';
 import ProfileMenu from './components/ProfileMenu';
 import Modal from './components/ui/Modal';
 import { useAuth } from './contexts/AuthContext';
 import { apiFetch, apiJson, QuotaError, QUOTA_WALL_EVENT } from './lib/api';
 import { track } from './lib/analytics';
+import { describeJobSettings } from './lib/jobSettings';
 
 // Enhanced "Encryption" using XOR + Base64 with a Salt
 // This is better than plain Base64 but still client-side.
@@ -340,6 +342,9 @@ function App() {
   const [autopilotOn, setAutopilotOn] = useState(false);
   const [showKeyModal, setShowKeyModal] = useState(false);
   const [jobId, setJobId] = useState(null);
+  // Read-only record of what the user chose when creating this job.
+  const [jobSettings, setJobSettings] = useState(null);
+  const [cancelState, setCancelState] = useState('idle'); // idle | confirm | sending
   const [status, setStatus] = useState('idle'); // idle, processing, complete, error
   const [results, setResults] = useState(null);
   // Best clips first. The backend hands them back in transcript order, which
@@ -610,6 +615,28 @@ function App() {
     setActiveTab('dashboard');
   };
 
+  // Open a project from the self-host Projects tab: the job is on this
+  // machine's disk, so the server already holds (or recovers) its record.
+  const openLocalProject = async (projectJobId) => {
+    const data = await pollJob(projectJobId);
+    flushClipState();
+    setProjectState(null);
+    setNoSource(false);
+    setJobId(projectJobId);
+    setResults(data.result || null);
+    setLogs(data.logs || []);
+    setLogTimes(data.log_times || []);
+    setQualityGate(null);
+    setJobError('');
+    setProcessingMedia({ type: 'server', payload: `/api/source/${projectJobId}` });
+    const running = data.status === 'processing' || data.status === 'queued';
+    setStatus(running ? 'processing' : data.status === 'failed' ? 'error' : 'complete');
+    if (data.status === 'failed') {
+      setJobError(readableError(data.logs?.length ? data.logs[data.logs.length - 1] : 'Process failed'));
+    }
+    setActiveTab('dashboard');
+  };
+
   // Apply one subtitle style to every clip of the job, sequentially.
   const handleBulkSubtitles = async (options) => {
     const clips = results?.clips || [];
@@ -862,6 +889,33 @@ function App() {
     }
     return () => clearInterval(interval);
   }, [status, jobId, refreshMe]);
+
+  // A job reopened later (history, reload) gets its settings back from the
+  // browser; jobs created before this existed simply show none.
+  useEffect(() => {
+    setCancelState('idle');
+    if (!jobId || jobSettings?.jobId === jobId) return;
+    try {
+      const stored = localStorage.getItem(`os_job_settings_${jobId}`);
+      setJobSettings(stored ? { jobId, items: JSON.parse(stored) } : null);
+    } catch {
+      setJobSettings(null);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobId]);
+
+  const cancelJob = async () => {
+    if (!jobId) return;
+    setCancelState('sending');
+    try {
+      const res = await apiFetch(`/api/cancel/${jobId}`, { method: 'POST' });
+      if (!res.ok) throw new Error(await res.text());
+      setLogs(prev => [...prev, 'Stopping…']);
+    } catch (e) {
+      console.error('Cancel failed', e);
+      setCancelState('idle');
+    }
+  };
 
 
   // silent: background auto-fetch — never alert(), just log. Managed users need
@@ -1211,6 +1265,12 @@ function App() {
       }
 
       setJobId(resData.job_id);
+      const settings = describeJobSettings(data, {
+        groq: !!groqKey && !billingEnabled,
+        model: localLlm?.model || 'Gemini',
+      });
+      setJobSettings({ jobId: resData.job_id, items: settings });
+      try { localStorage.setItem(`os_job_settings_${resData.job_id}`, JSON.stringify(settings)); } catch { /* ignore */ }
       setPartialJob(resData.partial || null);
       setFirstVideoJob(!!resData.first_video);
       // The server clipped past the balance on its own (no wall): the first
@@ -1314,6 +1374,8 @@ function App() {
     { id: 'ugc-gallery', ord: '05', icon: LayoutGrid, label: 'UGC Gallery', short: 'gallery', primary: true },
     { id: 'thumbnails', ord: '06', icon: Image, label: 'YouTube Studio', short: 'studio', primary: true },
     ...(billingEnabled && isSignedIn ? [{ id: 'history', ord: '07', icon: History, label: 'History', short: 'history' }] : []),
+    // Self-host: the jobs still on this machine's disk.
+    ...(!billingEnabled ? [{ id: 'projects', ord: '07', icon: History, label: 'Projects', short: 'projects' }] : []),
     { id: 'settings', ord: '08', icon: Settings, label: 'Settings', short: 'settings' },
   ];
   const activeNav = navItems.find((n) => n.id === activeTab);
@@ -2096,6 +2158,15 @@ function App() {
             </div>
           )}
 
+          {/* View: Projects (self-host) */}
+          {activeTab === 'projects' && (
+            <div className="h-full overflow-y-auto custom-scrollbar animate-fade">
+              <div className="max-w-6xl mx-auto p-4 sm:p-6 md:p-8">
+                <ProjectsTab onOpen={openLocalProject} />
+              </div>
+            </div>
+          )}
+
           {/* View: History */}
           {activeTab === 'history' && (
             <div className="h-full overflow-y-auto custom-scrollbar animate-fade">
@@ -2180,12 +2251,35 @@ function App() {
                     <Activity className={`text-brass ${status === 'processing' ? 'animate-pulse' : ''}`} size={18} />
                     Live Analysis
                   </h2>
-                  <span className={status === 'processing' ? 'badge-brass' :
-                    status === 'complete' ? 'badge-ok' :
-                      'badge-danger'
-                    }>
-                    {status.toUpperCase()}
-                  </span>
+                  <div className="flex items-center gap-2">
+                    {status === 'processing' && cancelState === 'idle' && (
+                      <button
+                        type="button"
+                        onClick={() => setCancelState('confirm')}
+                        className="btn-quiet py-1 px-2.5 text-xs lowercase flex items-center gap-1.5"
+                      >
+                        <X size={12} /> cancel
+                      </button>
+                    )}
+                    {status === 'processing' && cancelState === 'confirm' && (
+                      <span className="flex items-center gap-1.5 text-xs">
+                        <span className="text-ink2">stop generating?</span>
+                        <button type="button" onClick={cancelJob} className="btn-quiet py-1 px-2 text-xs text-danger lowercase">yes, stop</button>
+                        <button type="button" onClick={() => setCancelState('idle')} className="btn-quiet py-1 px-2 text-xs lowercase">no</button>
+                      </span>
+                    )}
+                    {status === 'processing' && cancelState === 'sending' && (
+                      <span className="flex items-center gap-1.5 text-xs text-muted">
+                        <Loader2 size={12} className="animate-spin" /> stopping…
+                      </span>
+                    )}
+                    <span className={status === 'processing' ? 'badge-brass' :
+                      status === 'complete' ? 'badge-ok' :
+                        'badge-danger'
+                      }>
+                      {status.toUpperCase()}
+                    </span>
+                  </div>
                 </div>
 
                 {/* Trimmed run: say it while it renders, not only once the
@@ -2229,6 +2323,21 @@ function App() {
                     isSyncedPlaying={isSyncedPlaying}
                     syncTrigger={syncTrigger}
                   />
+                )}
+
+                {/* What this job was created with — read only */}
+                {jobSettings?.jobId === jobId && jobSettings.items?.length > 0 && (
+                  <div className="mb-4 rounded-card border border-rule bg-paper2 px-3.5 py-3">
+                    <p className="eyebrow mb-2">settings</p>
+                    <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-xs">
+                      {jobSettings.items.map(([label, value]) => (
+                        <React.Fragment key={label}>
+                          <dt className="text-muted lowercase whitespace-nowrap">{label}</dt>
+                          <dd className="text-ink2 min-w-0 truncate" title={value}>{value}</dd>
+                        </React.Fragment>
+                      ))}
+                    </dl>
+                  </div>
                 )}
 
                 {/* Phones only. The scan box drops its invented telemetry at

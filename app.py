@@ -2016,6 +2016,10 @@ async def process_queue():
             # Wait for a job (priority, seq, job_id) — lowest priority first.
             _priority, _seq, job_id = await job_queue.get()
 
+            if (jobs.get(job_id) or {}).get('cancelled'):
+                job_queue.task_done()
+                continue
+
             if _draining:
                 # Leave it on disk for the next instance (manifest, no heartbeat).
                 print(f"⏸️ Draining — leaving {job_id} for the next instance.")
@@ -2196,6 +2200,7 @@ def is_transient_failure(logs) -> bool:
 
 def _should_auto_retry(job) -> bool:
     return bool(job and job.get('status') == 'failed' and not _draining
+                and not job.get('cancelled')
                 and int(job.get('auto_retries') or 0) < AUTO_RETRY_LIMIT
                 and job.get('cmd') and is_transient_failure(job.get('logs')))
 
@@ -3099,6 +3104,41 @@ async def _paid_proxy_budget_exceeded() -> bool:
         return False
 
 
+# Running main.py processes by job id, so /api/cancel can stop one.
+_job_processes = {}
+
+
+def _kill_process_tree(process):
+    """Stop main.py and every ffmpeg/ASR child it started (kill() alone would
+    leave the children encoding into the job dir)."""
+    try:
+        import psutil
+        parent = psutil.Process(process.pid)
+        for child in parent.children(recursive=True):
+            try:
+                child.kill()
+            except psutil.Error:
+                pass
+        parent.kill()
+    except Exception:
+        try:
+            process.kill()
+        except Exception:
+            pass
+
+
+def _finish_cancelled(job_id):
+    """A cancelled job keeps the clips that were already finished."""
+    job = jobs[job_id]
+    clips = ((job.get('result') or {}).get('clips')) or []
+    if clips:
+        job['status'] = 'completed'
+        job['logs'].append(f"Cancelled by user — kept the {len(clips)} clip(s) already finished.")
+    else:
+        job['status'] = 'failed'
+        job['logs'].append("Cancelled by user.")
+
+
 async def run_job(job_id, job_data):
     """Executes the subprocess for a specific job."""
 
@@ -3125,7 +3165,8 @@ async def run_job(job_id, job_data):
             cwd=os.getcwd(),
             **priority,
         )
-        
+        _job_processes[job_id] = process
+
         # We need to capture logs in a thread because Popen isn't async
         t_log = threading.Thread(target=enqueue_output, args=(process.stdout, job_id))
         t_log.daemon = True
@@ -3191,8 +3232,10 @@ async def run_job(job_id, job_data):
                 pass
 
         returncode = process.returncode
-        
-        if returncode == 0:
+
+        if jobs[job_id].get('cancelled'):
+            _finish_cancelled(job_id)
+        elif returncode == 0:
             jobs[job_id]['status'] = 'completed'
             jobs[job_id]['logs'].append("Process finished successfully.")
             
@@ -3243,6 +3286,72 @@ async def run_job(job_id, job_data):
         # Exception text can embed URLs with credentials (e.g. the proxy URL
         # inside a yt-dlp/httpx error) — scrub before it reaches client logs.
         jobs[job_id]['logs'].append(_scrub_secrets(f"Execution error: {str(e)}"))
+    finally:
+        _job_processes.pop(job_id, None)
+
+
+@app.post("/api/cancel/{job_id}")
+async def cancel_job(job_id: str, request: Request):
+    """Stop a queued or running job. Clips already finished are kept."""
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    await _assert_job_owner(request, job)
+    if job.get('status') not in ('queued', 'processing'):
+        return {"job_id": job_id, "status": job.get('status'), "cancelled": False}
+    job['cancelled'] = True
+    try:  # survives a restart, so the Projects list can still say "cancelled"
+        open(os.path.join(OUTPUT_DIR, job_id, ".cancelled"), "w").close()
+    except OSError:
+        pass
+    process = _job_processes.get(job_id)
+    if process is not None and process.poll() is None:
+        await asyncio.get_event_loop().run_in_executor(None, _kill_process_tree, process)
+    elif job.get('status') == 'queued':
+        # Never started: the worker skips it when it comes off the queue.
+        _finish_cancelled(job_id)
+        _clear_resume_manifest(job_id)
+    print(f"🛑 [cancel] job={job_id}")
+    return {"job_id": job_id, "status": job.get('status'), "cancelled": True}
+
+
+@app.get("/api/local/projects")
+async def local_projects():
+    """Self-host project list: every job directory still on disk, newest first.
+    Cloud has its own R2-backed History; this one only reads OUTPUT_DIR."""
+    if BILLING_ENABLED:
+        raise HTTPException(status_code=404, detail="Not found")
+    _recover_jobs_from_disk()
+    projects = []
+    try:
+        entries = os.listdir(OUTPUT_DIR)
+    except FileNotFoundError:
+        entries = []
+    for job_id in entries:
+        job_path = os.path.join(OUTPUT_DIR, job_id)
+        job = jobs.get(job_id)
+        if not os.path.isdir(job_path) or job_id == "thumbnails" or job is None:
+            continue
+        metas = glob.glob(os.path.join(job_path, "*_metadata.json"))
+        title = (os.path.basename(metas[0])[:-len("_metadata.json")] if metas else "")
+        if title.startswith(job_id + "_"):
+            title = title[len(job_id) + 1:]
+        status = job.get('status')
+        if job.get('cancelled') or os.path.exists(os.path.join(job_path, ".cancelled")):
+            status = 'cancelled'
+        clips = ((job.get('result') or {}).get('clips')) or []
+        ready = [c for c in clips if c.get('video_url') and os.path.exists(
+            os.path.join(job_path, os.path.basename(str(c['video_url']).split('?')[0])))]
+        projects.append({
+            "job_id": job_id,
+            "title": title or job_id[:8],
+            "status": status,
+            "clips": len(ready),
+            "created_at": os.path.getctime(job_path),
+            "thumbnail": ready[0]['video_url'] if ready else None,
+        })
+    projects.sort(key=lambda p: p["created_at"], reverse=True)
+    return {"projects": projects, "retention_seconds": JOB_RETENTION_SECONDS}
 
 @app.get("/health")
 async def health():
