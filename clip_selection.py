@@ -356,9 +356,39 @@ def _cut_over_long_clip(start, words, min_duration, max_duration, tail=0.2):
     return fitting[-1][0] + tail
 
 
+PAUSE_BOUNDARY_SECONDS = 0.5
+
+
+def _boundary_after(words, i):
+    """How cleanly a clip can cut right after word ``i``: 2 = sentence end,
+    1 = a pause of at least PAUSE_BOUNDARY_SECONDS, 0 = mid-phrase."""
+    if i < 0 or i + 1 >= len(words):
+        return 2
+    if str(words[i].get("w", "")).strip().endswith(_SENTENCE_END):
+        return 2
+    gap = float(words[i + 1].get("s", 0)) - float(words[i].get("e", 0))
+    return 1 if gap >= PAUSE_BOUNDARY_SECONDS else 0
+
+
+def _sentence_edge(target, words, times, offset, window):
+    """Time of the strongest phrase boundary within ``window`` of ``target``
+    (closest on a tie), or None. ``offset`` -1 looks at the boundary before
+    each word (starts), 0 the one after it (ends)."""
+    best = None
+    for i, t in enumerate(times):
+        dist = abs(t - target)
+        if dist > window:
+            continue
+        strength = _boundary_after(words, i + offset)
+        if strength and (best is None or (strength, -dist) > best[0]):
+            best = ((strength, -dist), t)
+    return best[1] if best else None
+
+
 def snap_clip_to_words(start, end, words, video_duration,
                        min_duration=15.0, max_duration=60.0,
-                       search_window=1.5, max_lead=0.35, max_tail=0.45):
+                       search_window=1.5, max_lead=0.35, max_tail=0.45,
+                       sentence_window=3.0):
     """
     Snap Gemini-proposed clip boundaries onto real word boundaries plus a bit
     of the surrounding silence. LLMs are bad at millisecond arithmetic; the
@@ -376,9 +406,17 @@ def snap_clip_to_words(start, end, words, video_duration,
     starts = [float(w.get("s", 0)) for w in words]
     ends = [float(w.get("e", 0)) for w in words]
 
+    # Models propose round numbers ("70.0", "134.0") that land a word into the
+    # previous sentence or one word short of the last one. A phrase boundary
+    # (sentence end, else a real pause) within sentence_window wins over the
+    # nearest word.
+
     # START: snap to the nearest word start, then lead into the silence before it.
     new_start = float(start)
     candidates = [s for s in starts if abs(s - new_start) <= search_window]
+    edge = _sentence_edge(new_start, words, starts, -1, sentence_window)
+    if edge is not None:
+        candidates = [edge]
     if candidates:
         word_start = min(candidates, key=lambda s: abs(s - new_start))
         prev_ends = [e for e in ends if e <= word_start]
@@ -392,6 +430,9 @@ def snap_clip_to_words(start, end, words, video_duration,
     # END: snap to the nearest word end, then trail into the silence after it.
     new_end = float(end)
     candidates = [e for e in ends if abs(e - new_end) <= search_window]
+    edge = _sentence_edge(new_end, words, ends, 0, sentence_window)
+    if edge is not None and edge > new_start:
+        candidates = [edge]
     if candidates:
         word_end = min(candidates, key=lambda e: abs(e - new_end))
         next_starts = [s for s in starts if s >= word_end]

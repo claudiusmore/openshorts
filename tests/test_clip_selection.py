@@ -125,6 +125,43 @@ class TestSnapClipToWords:
         start, end = snap_clip_to_words(0.0, 40.0, words, 80.0)
         assert 39.6 <= end <= 40.05
 
+    def test_end_reaches_the_sentence_final_word(self):
+        # Real case: the model said 134.0, the nearest word end was "por" and
+        # the clip lost "dia." — the sentence end 0.4 s later must win.
+        words = [_word(" 5", 133.2, 133.5), _word(" milhões", 133.5, 133.8),
+                 _word(" por", 133.8, 134.1), _word(" dia.", 134.1, 134.4),
+                 _word(" Aí", 136.6, 136.8), _word(" ele", 136.8, 136.9)]
+        words = [_word(f" w{i}", 100.0 + i * 0.5, 100.4 + i * 0.5) for i in range(60)] + words
+        _, end = snap_clip_to_words(110.0, 134.0, words, 200.0)
+        assert 134.4 <= end <= 134.85
+
+    def test_start_moves_to_the_sentence_start(self):
+        # "...a energia, a metafísica no geral. E aí," — 70.0 must not open on
+        # the tail of the previous sentence.
+        words = [_word(f" w{i}", 50.0 + i * 0.5, 50.4 + i * 0.5) for i in range(39)]
+        words += [_word(" a", 69.5, 69.7), _word(" energia,", 69.7, 70.4),
+                 _word(" a", 70.5, 70.8), _word(" metafísica", 70.8, 71.4),
+                 _word(" no", 71.4, 71.5), _word(" geral.", 71.5, 72.0),
+                 _word(" E", 72.4, 72.6), _word(" aí,", 72.6, 72.9)]
+        words += [_word(f" w{i}", 73.0 + i * 0.5, 73.4 + i * 0.5) for i in range(80)]
+        start, _ = snap_clip_to_words(70.0, 110.0, words, 200.0)
+        assert 72.0 <= start <= 72.4
+
+    def test_pause_counts_as_a_boundary_without_punctuation(self):
+        # Groq words often lack punctuation: "...na alma e no corpo [1.6 s] as pessoas".
+        words = [_word(f" w{i}", 200.0 + i * 0.5, 200.4 + i * 0.5) for i in range(88)]
+        words += [_word(" na", 243.9, 244.0), _word(" alma", 244.0, 244.4),
+                  _word(" e", 244.4, 244.6), _word(" no", 244.6, 244.7),
+                  _word(" corpo", 244.7, 245.1), _word(" as", 246.7, 246.9),
+                  _word(" pessoas", 246.9, 247.3)]
+        _, end = snap_clip_to_words(210.0, 244.0, words, 300.0)
+        assert 245.1 <= end <= 245.6
+
+    def test_no_boundary_nearby_keeps_nearest_word(self):
+        words = self._words()  # uniform 0.4 s gaps, no punctuation
+        _, end = snap_clip_to_words(10.0, 30.1, words, 80.0)
+        assert 29.6 <= end <= 30.05
+
 
 class TestPricing:
     def test_known_models(self):
