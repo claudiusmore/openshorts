@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { Loader2 } from 'lucide-react';
 import { apiFetch } from '../lib/api';
+import { retimeEditedWords } from '../lib/retimeCaptions';
 import RemotionPreview from './RemotionPreview';
 import Modal from './ui/Modal';
 import SegmentedControl from './ui/SegmentedControl';
@@ -196,7 +197,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
             .finally(() => setCaptionsLoading(false));
     }, [isOpen, jobId, clipIndex]);
 
-    // When user edits text, redistribute words across original timestamps
+    // When user edits text, keep each word on the original speech timing
     const handleTextEdit = (newText) => {
         setEditableText(newText);
         const newWords = newText.split(/\s+/).filter(w => w.length > 0);
@@ -204,18 +205,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
             setCaptions([]);
             return;
         }
-
-        // Distribute new words across the time span of original captions
-        const totalDurationMs = originalCaptions[originalCaptions.length - 1].endMs - originalCaptions[0].startMs;
-        const startMs = originalCaptions[0].startMs;
-        const wordDurationMs = totalDurationMs / newWords.length;
-
-        const newCaptions = newWords.map((word, i) => ({
-            text: word,
-            startMs: Math.round(startMs + i * wordDurationMs),
-            endMs: Math.round(startMs + (i + 1) * wordDurationMs),
-        }));
-        setCaptions(newCaptions);
+        setCaptions(retimeEditedWords(originalCaptions, newWords));
     };
 
     if (!isOpen) return null;
