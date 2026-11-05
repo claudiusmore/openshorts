@@ -266,7 +266,8 @@ def perform_recut(*, input_path, segments, output_dir, clean_name,
                   reframe=False, output_format="auto", watermark=False,
                   captions_transcript=None, force_strategy=None,
                   crop_overrides=None, runner=None, renderer=None,
-                  watermarker=None, captioner=None, subtitle_band=None):
+                  watermarker=None, captioner=None, subtitle_band=None,
+                  music=None, cut_from=None, hooker=None):
     """Render a recut clip. Returns (served_filename, clean_filename).
 
     - ``input_path``/``segments``: the file to cut from and the times ON THAT
@@ -283,6 +284,12 @@ def perform_recut(*, input_path, segments, output_dir, clean_name,
       source width, for scenes the user framed by hand. Source path only, for
       the same reason as ``reframe``: the canonical file is already cropped, so
       its framing can no longer be changed.
+    - ``music``: ``(path, volume)`` of the job's background track, mixed under
+      the new cut before captions go on (see background_music).
+    - ``cut_from``: a stand-in for ``input_path`` to cut from (the music-free
+      copy of the canonical clip); layout ranges still come from ``input_path``.
+    - ``hooker``: ``(path, has_captions) -> hooked path or None``; burns the
+      clip's hook text on the new cut, under the captions.
 
     The renderer/watermarker/captioner hooks default to main.py's
     implementations, imported lazily so this module stays importable without
@@ -297,7 +304,7 @@ def perform_recut(*, input_path, segments, output_dir, clean_name,
     work_path = os.path.join(output_dir, work_name)
 
     try:
-        run_cut_concat(input_path, segments, work_path, output_dir,
+        run_cut_concat(cut_from or input_path, segments, work_path, output_dir,
                        runner=runner)
 
         if reframe:
@@ -322,13 +329,28 @@ def perform_recut(*, input_path, segments, output_dir, clean_name,
                 (r["start"], r["end"], r["layout"], r.get("content"))
                 for r in layout_ranges.remap(layout_ranges.read(input_path), segments)])
 
+        if music:
+            import background_music
+            background_music.mix_into(out_path, *music)
+
         if watermark:
             (watermarker or _main_attr("apply_watermark"))(out_path)
 
         served_name = out_name
-        if captions_transcript and captions_transcript.get("segments"):
+        top_path = out_path
+        wants_captions = bool(captions_transcript and captions_transcript.get("segments"))
+        if hooker:
+            hooked = hooker(out_path, wants_captions)
+            if hooked:
+                top_path, served_name = hooked, os.path.basename(hooked)
+                # The captioners place themselves from the file's layout sidecar.
+                import layout_ranges
+                if os.path.exists(layout_ranges.sidecar_path(out_path)):
+                    shutil.copyfile(layout_ranges.sidecar_path(out_path),
+                                    layout_ranges.sidecar_path(hooked))
+        if wants_captions:
             caption = captioner or _main_attr("auto_caption_clip")
-            captioned = caption(out_path, captions_transcript,
+            captioned = caption(top_path, captions_transcript,
                                 0.0, total_duration(segments))
             if captioned:
                 served_name = os.path.basename(captioned)

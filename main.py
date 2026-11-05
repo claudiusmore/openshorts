@@ -2801,7 +2801,8 @@ if __name__ == '__main__':
                     if success and os.environ.get("BG_MUSIC_PATH"):
                         import background_music
                         if background_music.mix_into(clip_final_path, os.environ["BG_MUSIC_PATH"],
-                                                     os.environ.get("BG_MUSIC_VOLUME")):
+                                                     os.environ.get("BG_MUSIC_VOLUME"),
+                                                     keep_clean=True):
                             print(f"   🎵 Background music mixed into clip {i+1}")
                     deliver_path = clip_final_path
                     # Which stretches were stacked (SPLIT): captions go on the

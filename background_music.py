@@ -6,13 +6,48 @@ back up in the pauses, so it never fights the voice. Mixed into the canonical
 clip right after the reframe, so the hook, captions and later re-renders all
 inherit it.
 """
+import json
 import os
+import shutil
 import subprocess
 
 ALLOWED_EXTENSIONS = (".mp3", ".m4a", ".aac", ".wav", ".ogg", ".flac")
 DEFAULT_VOLUME = 0.15
 FADE_IN = 1.0
 FADE_OUT = 1.5
+SETTINGS_FILE = "background_music.json"
+# Copy of the canonical clip as it was before the music went in. The editor's
+# fast recut cuts from it so the music can be laid again over the new length
+# (fades included) instead of keeping a chopped, baked-in bed. No media
+# extension, so the clip globs (``*_clip_*.mp4``) never pick it up.
+CLEAN_SUFFIX = ".nomusic"
+
+
+def clean_copy_path(video_path):
+    return video_path + CLEAN_SUFFIX
+
+
+def save_settings(job_dir, music_path, volume):
+    with open(os.path.join(job_dir, SETTINGS_FILE), "w") as f:
+        json.dump({"file": os.path.basename(music_path),
+                   "volume": clamp_volume(volume)}, f)
+
+
+def job_music(job_dir):
+    """(music_path, volume) chosen for this job, or None."""
+    try:
+        with open(os.path.join(job_dir, SETTINGS_FILE)) as f:
+            cfg = json.load(f)
+        path = os.path.join(job_dir, os.path.basename(cfg["file"]))
+        volume = clamp_volume(cfg.get("volume"))
+    except (OSError, ValueError, KeyError, TypeError):
+        # Jobs from before the settings file: the track is there, the volume
+        # is not, so fall back to the default.
+        path = next((os.path.join(job_dir, f"background_music{ext}")
+                     for ext in ALLOWED_EXTENSIONS
+                     if os.path.exists(os.path.join(job_dir, f"background_music{ext}"))), None)
+        volume = DEFAULT_VOLUME
+    return (path, volume) if path and os.path.exists(path) else None
 
 
 def clamp_volume(value, default=DEFAULT_VOLUME):
@@ -54,12 +89,15 @@ def build_filter(duration, volume, has_voice=True):
     )
 
 
-def mix_into(video_path, music_path, volume=DEFAULT_VOLUME):
+def mix_into(video_path, music_path, volume=DEFAULT_VOLUME, keep_clean=False):
     """Mix ``music_path`` under ``video_path`` in place. Returns True on success;
-    on any failure the clip is left untouched."""
+    on any failure the clip is left untouched. ``keep_clean`` first saves the
+    music-free file at ``clean_copy_path(video_path)``."""
     if not (music_path and os.path.exists(music_path) and os.path.exists(video_path)):
         return False
     try:
+        if keep_clean:
+            shutil.copyfile(video_path, clean_copy_path(video_path))
         duration = float(_probe(video_path, ["-show_entries", "format=duration"]) or 0)
         if duration <= 0:
             return False

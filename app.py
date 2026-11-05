@@ -1291,6 +1291,34 @@ def _recut_captioner(clip):
         path, transcript, start, end, style)
 
 
+_HOOK_SIZES = {"S": 0.8, "M": 1.0, "L": 1.3}
+
+
+def _recut_hooker(clip):
+    """perform_recut's ``hooker``: burns the hook recorded on the clip
+    (auto-hook or /api/hook) on the new cut, or None when it has no hook."""
+    cfg = clip.get('auto_hook') or {}
+    text = (cfg.get('text') or '').strip()
+    if not text:
+        return None
+
+    def burn(path, has_captions):
+        out = os.path.join(os.path.dirname(path),
+                           f"hooked_{int(time.time())}_{os.path.basename(path)}")
+        try:
+            add_hook_to_video(
+                path, text, out, position=cfg.get('position') or "auto",
+                font_scale=_HOOK_SIZES.get(cfg.get('size'), 1.0),
+                duration=cfg.get('duration_seconds'), style=cfg.get('style') or "pill",
+                font=cfg.get('font'), layout_ranges=layout_ranges.read(path),
+                has_captions=has_captions)
+        except Exception as e:
+            print(f"⚠️ Hook not re-applied on the recut ({type(e).__name__}: {e})")
+            return None
+        return out if os.path.exists(out) else None
+    return burn
+
+
 def _recover_jobs_from_disk():
     """Rebuild completed jobs from OUTPUT_DIR after a restart (issue #46 / #18).
 
@@ -3882,6 +3910,8 @@ async def process_endpoint(
                 fh.write(chunk)
         env["BG_MUSIC_PATH"] = music_path
         env["BG_MUSIC_VOLUME"] = str(background_music.clamp_volume(music_volume))
+        # Remembered so editor re-renders can lay the same track again.
+        background_music.save_settings(job_output_dir, music_path, music_volume)
         print(f"[music] job={job_id} volume={env['BG_MUSIC_VOLUME']}")
     # The stdio fix above only covers this process. main.py prints an emoji on
     # its first line and configures nothing, so on a cp1252 console the child
@@ -5109,22 +5139,31 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
     v_transcript = (recut.virtual_transcript(transcript, segments)
                     if req.reapply_captions else None)
 
+    import background_music
+    music = background_music.job_music(output_dir)
+    clean_canonical = background_music.clean_copy_path(canonical_path)
+    # The canonical file already carries the music: without its music-free
+    # copy (jobs from before it existed) the fast path keeps the baked bed.
+    fast_music = music if os.path.exists(clean_canonical) else None
+
     def run_recut():
         if fast:
             return recut.perform_recut(
                 input_path=canonical_path,
+                cut_from=clean_canonical if fast_music else None,
+                music=fast_music,
                 segments=recut.rebase_segments(
                     segments, canonical_range['start'], canonical_range['end']),
                 output_dir=output_dir, clean_name=clean_name,
                 reframe=False, captions_transcript=v_transcript,
-                captioner=_recut_captioner(clip))
+                captioner=_recut_captioner(clip), hooker=_recut_hooker(clip))
         return recut.perform_recut(
             input_path=source_path, segments=segments,
             output_dir=output_dir, clean_name=clean_name,
             reframe=True, output_format=data.get('output_format', 'auto'),
-            force_strategy=force_strategy,
+            force_strategy=force_strategy, music=music,
             captions_transcript=v_transcript,
-            captioner=_recut_captioner(clip),
+            captioner=_recut_captioner(clip), hooker=_recut_hooker(clip),
             # Trim the source's own subtitles only when ours go back on.
             subtitle_band=(data.get('source_subtitle_band')
                            if v_transcript else None))
@@ -5485,6 +5524,7 @@ async def _reframe_locked(req: ReframeRequest, request: Request, job, overrides)
     # and captioning and the path blew past the filesystem limit:
     # "Error opening output ...: File name too long".
     clean_name = f"{base_name}_clip_{req.clip_index + 1}.mp4"
+    import background_music
 
     def run():
         return recut.perform_recut(
@@ -5493,8 +5533,9 @@ async def _reframe_locked(req: ReframeRequest, request: Request, job, overrides)
             reframe=True, output_format=data.get('output_format', 'auto'),
             force_strategy=force_strategy,
             crop_overrides=overrides,
+            music=background_music.job_music(output_dir),
             captions_transcript=v_transcript,
-            captioner=_recut_captioner(clip),
+            captioner=_recut_captioner(clip), hooker=_recut_hooker(clip),
             # Trim the source's own subtitles only when ours go back on.
             subtitle_band=(data.get('source_subtitle_band')
                            if v_transcript else None))
@@ -6117,8 +6158,7 @@ async def add_hook(req: HookRequest, request: Request):
         output_path = os.path.join(output_dir, output_filename)
 
         # Map Size to Scale
-        size_map = {"S": 0.8, "M": 1.0, "L": 1.3}
-        font_scale = size_map.get(req.size, 1.0)
+        font_scale = _HOOK_SIZES.get(req.size, 1.0)
 
         # Meter the FFmpeg overlay re-encode (no-op for BYOK / self-host).
         hook_minutes = _cloud_config.EDITOR_ACTION_MINUTES if BILLING_ENABLED else 0
@@ -6162,7 +6202,7 @@ async def add_hook(req: HookRequest, request: Request):
     else:
         clip_data['auto_hook'] = {
             "text": req.text, "style": req.style, "font": req.font, "position": req.position,
-            "duration_seconds": req.duration_seconds,
+            "duration_seconds": req.duration_seconds, "size": req.size,
         }
 
     # Update Persistence (Same logic as subtitles)
