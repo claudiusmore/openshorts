@@ -3114,13 +3114,16 @@ async def run_job(job_id, job_data):
     print(f"🎬 [run_job] Executing command for {job_id}: {' '.join(cmd)}")
     
     try:
+        # preexec_fn does not exist on Windows; the priority class is its equivalent.
+        priority = ({"creationflags": subprocess.BELOW_NORMAL_PRIORITY_CLASS} if os.name == "nt"
+                    else {"preexec_fn": _lower_priority})
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, # Merge stderr to stdout
             env=env,
             cwd=os.getcwd(),
-            preexec_fn=_lower_priority,
+            **priority,
         )
         
         # We need to capture logs in a thread because Popen isn't async
