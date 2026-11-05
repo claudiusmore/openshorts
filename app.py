@@ -3743,6 +3743,12 @@ async def process_endpoint(
         env["GEMINI_API_KEY"] = api_key # Override with key from request
     else:
         env.pop("GEMINI_API_KEY", None)  # local-LLM job: main.py must not find a stale key
+    # Self-host BYOK: a Groq key from the dashboard switches this job's
+    # transcription to Groq's hosted Whisper (falls back to local whisper).
+    groq_key = None if BILLING_ENABLED else (request.headers.get("X-Groq-Key") or "").strip()
+    if groq_key:
+        env["GROQ_API_KEY"] = groq_key
+        env["TRANSCRIBE_BACKEND"] = "groq"
     # The stdio fix above only covers this process. main.py prints an emoji on
     # its first line and configures nothing, so on a cp1252 console the child
     # still dies before it renders anything -- the server starts and every job

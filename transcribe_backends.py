@@ -18,7 +18,9 @@ Invariants the consumers rely on (clip cutting, karaoke subtitles, Remotion):
   - all numerics are native Python floats (json.dump of the transcript).
   - words sorted by start, segments chronological, absolute file timestamps.
 
-TRANSCRIBE_BACKEND env: "whisper" (default) | "parakeet".
+TRANSCRIBE_BACKEND env: "whisper" (default) | "parakeet" | "groq".
+The groq path (hosted Whisper, needs GROQ_API_KEY) falls back to local whisper
+on any error or an empty result.
 The parakeet path falls back to whisper automatically when the model errors,
 produces no usable words, or the detected language is outside its 25
 supported European languages (e.g. Japanese/Chinese/Arabic uploads).
@@ -627,6 +629,137 @@ def _parakeet_fallback_reason(transcript, duration_hint=None):
     return None
 
 
+# --- groq (hosted whisper) --------------------------------------------------
+# TRANSCRIBE_BACKEND=groq sends the audio to Groq's hosted Whisper
+# (whisper-large-v3-turbo by default, GROQ_API_KEY required). On a CPU-only
+# host this turns most of an hour of local transcription into a minute or two.
+# Uploads are capped per file, so the audio goes up in GROQ_CHUNK_SECONDS mono
+# mp3 chunks and every timestamp is offset back to file time.
+
+GROQ_API_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+GROQ_DEFAULT_MODEL = "whisper-large-v3-turbo"
+GROQ_CHUNK_SECONDS = int(os.environ.get("GROQ_CHUNK_SECONDS", "600"))
+
+# Groq reports the language by name ("Portuguese"); the pipeline wants ISO codes.
+_WHISPER_LANGUAGE_CODES = {
+    "english": "en", "portuguese": "pt", "spanish": "es", "french": "fr",
+    "german": "de", "italian": "it", "dutch": "nl", "russian": "ru",
+    "polish": "pl", "turkish": "tr", "japanese": "ja", "chinese": "zh",
+    "korean": "ko", "arabic": "ar", "hindi": "hi", "ukrainian": "uk",
+    "swedish": "sv", "czech": "cs", "romanian": "ro", "greek": "el",
+    "danish": "da", "finnish": "fi", "hungarian": "hu", "norwegian": "no",
+    "catalan": "ca", "indonesian": "id", "vietnamese": "vi", "hebrew": "he",
+}
+
+
+def _groq_chunks(media_path, workdir, chunk_seconds=None):
+    """Split the audio into mono mp3 chunks; returns ``[(offset_seconds, path)]``.
+
+    Offsets come from each chunk's probed duration, not ``i * chunk_seconds``:
+    the segment muxer cuts on frame boundaries, so the nominal value drifts."""
+    chunk_seconds = chunk_seconds or GROQ_CHUNK_SECONDS
+    pattern = os.path.join(workdir, "chunk_%04d.mp3")
+    subprocess.run(
+        ["ffmpeg", "-y", "-loglevel", "error", "-i", media_path, "-vn", "-ac", "1",
+         "-ar", "16000", "-c:a", "libmp3lame", "-b:a", "64k", "-f", "segment",
+         "-segment_time", str(chunk_seconds), "-reset_timestamps", "1", pattern],
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=1800)
+    chunks, offset = [], 0.0
+    for name in sorted(os.listdir(workdir)):
+        path = os.path.join(workdir, name)
+        chunks.append((offset, path))
+        probe = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", path], capture_output=True, text=True, timeout=60)
+        offset += float(probe.stdout.strip() or chunk_seconds)
+    return chunks
+
+
+def _groq_request(path, api_key, model, attempts=4):
+    """One verbose_json transcription with word + segment timestamps."""
+    import httpx
+
+    data = {"model": model, "response_format": "verbose_json", "temperature": "0",
+            "timestamp_granularities[]": ["word", "segment"]}
+    for attempt in range(1, attempts + 1):
+        with open(path, "rb") as fh:
+            resp = httpx.post(
+                GROQ_API_URL, headers={"Authorization": f"Bearer {api_key}"},
+                data=data, files={"file": (os.path.basename(path), fh, "audio/mpeg")},
+                timeout=300)
+        if resp.status_code == 200:
+            return resp.json()
+        if resp.status_code in (429, 500, 502, 503, 504) and attempt < attempts:
+            try:
+                wait = min(float(resp.headers.get("retry-after") or 0), 60) or 5 * attempt
+            except ValueError:
+                wait = 5 * attempt
+            print(f"⚠️ [ASR] groq {resp.status_code}, retrying in {wait:.0f}s")
+            time.sleep(wait)
+            continue
+        raise RuntimeError(f"groq {resp.status_code}: {resp.text[:300]}")
+
+
+def _groq_segment_words(seg_text, raw_words, offset):
+    """Words of one segment in the pipeline's shape (leading space, file time).
+
+    Groq's word timestamps drop punctuation; when the segment text splits into
+    the same number of tokens, those tokens (with punctuation) replace the words
+    so karaoke captions keep "metas," and "hoje." like faster-whisper's."""
+    tokens = seg_text.split()
+    use_tokens = len(tokens) == len(raw_words)
+    words = []
+    for i, w in enumerate(raw_words):
+        text = (tokens[i] if use_tokens else str(w.get("word", ""))).strip()
+        if text:
+            words.append({"word": " " + text, "start": float(offset + w["start"]),
+                          "end": float(offset + w["end"])})
+    return words
+
+
+def _groq_transcript(results):
+    """Merge ``[(offset, verbose_json)]`` chunk results into the transcript contract."""
+    segments, language = [], None
+    for offset, data in results:
+        language = language or str(data.get("language") or "").strip().lower()
+        words = sorted(data.get("words") or [], key=lambda w: w["start"])
+        chunk_segments = [s for s in data.get("segments") or [] if (s.get("text") or "").strip()]
+        wi = 0
+        for n, s in enumerate(chunk_segments):
+            last = n == len(chunk_segments) - 1
+            raw = []
+            while wi < len(words) and (last or (words[wi]["start"] + words[wi]["end"]) / 2 <= s["end"]):
+                raw.append(words[wi])
+                wi += 1
+            text = s["text"].strip()
+            segments.append({
+                "start": float(offset + s["start"]),
+                "end": float(offset + s["end"]),
+                "text": " " + text,
+                "words": _groq_segment_words(text, raw, offset),
+            })
+    full_text = " ".join(s["text"].strip() for s in segments)
+    code = _WHISPER_LANGUAGE_CODES.get(language) or (
+        language if language and len(language) == 2 else _detect_language(full_text))
+    return {"text": full_text, "language": code, "segments": segments}
+
+
+def _transcribe_with_groq(media_path):
+    api_key = (os.environ.get("GROQ_API_KEY") or "").strip()
+    if not api_key:
+        raise RuntimeError("GROQ_API_KEY is not set")
+    model = (os.environ.get("GROQ_MODEL") or GROQ_DEFAULT_MODEL).strip()
+    started = time.time()
+    with tempfile.TemporaryDirectory(prefix="asr_groq_") as workdir:
+        chunks = _groq_chunks(media_path, workdir)
+        results = []
+        for i, (offset, path) in enumerate(chunks, 1):
+            results.append((offset, _groq_request(path, api_key, model)))
+            print(f"🎙️ Transcribing… {round(100 * i / len(chunks))}% "
+                  f"({time.time() - started:.0f}s) [groq]")
+    return _groq_transcript(results)
+
+
 # --- public entry point -----------------------------------------------------
 
 class NoAudioError(Exception):
@@ -659,6 +792,18 @@ def transcribe_media(media_path):
             "speech, so it needs a video with audio.")
 
     backend = os.environ.get("TRANSCRIBE_BACKEND", "whisper").strip().lower()
+
+    if backend == "groq":
+        try:
+            transcript = _transcribe_with_groq(media_path)
+            if any(s["words"] for s in transcript["segments"]):
+                print(f"🎙️ [ASR] groq ok: lang={transcript['language']} "
+                      f"segments={len(transcript['segments'])}")
+                return transcript
+            print("⚠️ [ASR] groq returned no words — falling back to whisper")
+        except Exception as e:
+            print(f"⚠️ [ASR] groq failed ({type(e).__name__}: {e}) — "
+                  f"falling back to whisper")
 
     if backend == "parakeet":
         try:

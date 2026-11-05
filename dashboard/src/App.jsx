@@ -306,6 +306,14 @@ function App() {
     return '';
   });
 
+  // Groq API State (self-host fast transcription) - Load encrypted
+  const [groqKey, setGroqKey] = useState(() => {
+    const stored = localStorage.getItem('groqKey_v1');
+    if (stored) return decrypt(stored);
+    return '';
+  });
+  const [groqSaved, setGroqSaved] = useState(false);
+
   // fal.ai API State - Load encrypted
   const [falKey, setFalKey] = useState(() => {
     const stored = localStorage.getItem('falKey_v1');
@@ -1127,6 +1135,7 @@ function App() {
       // BYOK sends the Gemini header; managed users rely on the bearer token
       // that apiFetch attaches automatically.
       const headers = apiKey ? { 'X-Gemini-Key': apiKey } : {};
+      if (groqKey && !billingEnabled) headers['X-Groq-Key'] = groqKey;
 
       // Advanced generation controls: only sent when the user set them, so the
       // default request stays byte-identical to the pre-feature one.
@@ -1762,6 +1771,47 @@ function App() {
               </div>
 
                 </>
+              )}
+
+              {!billingEnabled && (
+                <div className="card p-4 sm:p-6 mt-8">
+                  <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
+                    <h2 className="text-base font-medium text-ink lowercase">Fast Transcription</h2>
+                    <span className="readout">BYOK · optional</span>
+                  </div>
+                  <p className="text-xs text-muted mb-6 leading-relaxed">
+                    Transcribe with <strong>Groq</strong>&apos;s hosted Whisper (whisper-large-v3-turbo) instead of
+                    this machine&apos;s CPU: a 30-minute video goes from most of an hour to about a minute. Free tier
+                    available. Leave empty to keep local transcription; if Groq fails, the job falls back to it.
+                  </p>
+                  <div className="space-y-4">
+                    <label className="block text-sm text-muted">Groq API Key</label>
+                    <div className="flex flex-col sm:flex-row gap-2">
+                      <input
+                        type="password"
+                        value={groqKey}
+                        onChange={(e) => setGroqKey(e.target.value)}
+                        className="input-field"
+                        placeholder="gsk_..."
+                      />
+                      <button
+                        onClick={() => {
+                          if (groqKey) localStorage.setItem('groqKey_v1', encrypt(groqKey));
+                          else localStorage.removeItem('groqKey_v1');
+                          setGroqSaved(true);
+                          setTimeout(() => setGroqSaved(false), 2000);
+                        }}
+                        className={groqSaved ? 'badge-ok px-4' : 'btn-quiet py-2 px-4 text-sm'}
+                      >
+                        {groqSaved ? <><Check size={12} /> saved</> : 'Save'}
+                      </button>
+                    </div>
+                    <div className="text-xs text-muted">
+                      Get a key at{' '}
+                      <a href="https://console.groq.com/keys" target="_blank" rel="noopener noreferrer" className="text-brass hover:underline">console.groq.com/keys</a>.
+                    </div>
+                  </div>
+                </div>
               )}
 
               <div className="card p-4 sm:p-6 mt-8">

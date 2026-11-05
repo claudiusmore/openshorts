@@ -465,3 +465,54 @@ def test_repair_failure_keeps_parakeet_text(monkeypatch):
     t = _drift_transcript()
     assert tb._repair_script_drift(t, "/tmp/x.wav") == 0
     assert t["segments"][1]["text"].startswith("Тудей")
+
+
+# --- groq -------------------------------------------------------------------
+
+def _groq_chunk(language, segments, words):
+    return {"language": language, "segments": segments, "words": words}
+
+
+def test_groq_transcript_offsets_chunks_and_keeps_punctuation():
+    first = _groq_chunk(
+        "Portuguese",
+        [{"start": 0.0, "end": 2.0, "text": " Olá, pessoal."},
+         {"start": 2.0, "end": 3.0, "text": " "}],
+        [{"word": "Olá", "start": 0.1, "end": 0.6}, {"word": "pessoal", "start": 0.7, "end": 1.5}],
+    )
+    second = _groq_chunk(
+        "Portuguese",
+        [{"start": 0.5, "end": 1.5, "text": " Bora lá!"}],
+        [{"word": "Bora", "start": 0.5, "end": 0.9}, {"word": "lá", "start": 1.0, "end": 1.4}],
+    )
+    t = tb._groq_transcript([(0.0, first), (600.0, second)])
+    assert t["language"] == "pt"
+    assert len(t["segments"]) == 2  # the blank segment is dropped
+    assert [w["word"] for w in t["segments"][0]["words"]] == [" Olá,", " pessoal."]
+    seg2 = t["segments"][1]
+    assert seg2["start"] == pytest.approx(600.5)
+    assert seg2["words"][1] == {"word": " lá!", "start": pytest.approx(601.0), "end": pytest.approx(601.4)}
+    assert t["text"] == "Olá, pessoal. Bora lá!"
+
+
+def test_groq_transcript_assigns_words_by_midpoint_and_keeps_leftovers():
+    data = _groq_chunk(
+        "english",
+        [{"start": 0.0, "end": 1.0, "text": " one two"},
+         {"start": 1.0, "end": 2.0, "text": " three"}],
+        [{"word": "one", "start": 0.0, "end": 0.4}, {"word": "two", "start": 0.8, "end": 1.1},
+         {"word": "three", "start": 1.2, "end": 1.6}, {"word": "four", "start": 2.1, "end": 2.3}],
+    )
+    t = tb._groq_transcript([(0.0, data)])
+    assert [w["word"] for w in t["segments"][0]["words"]] == [" one", " two"]
+    # Token count differs from word count: raw words, still with a leading space.
+    assert [w["word"] for w in t["segments"][1]["words"]] == [" three", " four"]
+    assert t["language"] == "en"
+
+
+def test_transcribe_media_groq_falls_back_to_whisper(monkeypatch):
+    monkeypatch.setenv("TRANSCRIBE_BACKEND", "groq")
+    monkeypatch.setattr(tb, "_has_audio_stream", lambda p: True)
+    monkeypatch.setattr(tb, "_transcribe_with_groq", lambda p: (_ for _ in ()).throw(RuntimeError("429")))
+    monkeypatch.setattr(tb, "_transcribe_with_whisper", lambda p: {"text": "x", "language": "en", "segments": []})
+    assert tb.transcribe_media("a.mp4")["text"] == "x"
