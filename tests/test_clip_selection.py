@@ -90,6 +90,41 @@ class TestSnapClipToWords:
         start, end = snap_clip_to_words(0.0, 59.9, words, 80.0)
         assert end - start <= 60.0
 
+    def test_over_long_clip_ends_on_last_sentence_that_fits(self):
+        # Model proposes 95 s for a 60 s cap; the last full stop before the cap
+        # is the word ending at 51.6 s — the clip must end there, not at 59.6.
+        words = self._words()  # w0..w39 every 2 s
+        words += [_word(f"x{i}", 80.0 + i * 2.0, 81.6 + i * 2.0) for i in range(10)]
+        words[20]["w"] = " acabou."
+        words[25]["w"] = " fim."
+        start, end = snap_clip_to_words(0.0, 95.0, words, 120.0)
+        assert end == pytest.approx(51.8)
+        assert end - start <= 60.0
+
+    def test_over_long_clip_without_punctuation_cuts_on_longest_late_pause(self):
+        words = [_word(f"w{i}", i * 1.0, i * 1.0 + 0.8) for i in range(100)]
+        # A 1.5 s pause after the word ending at 48.8 s (and an early one at 16.8 s).
+        for w in words[49:]:
+            w["s"] += 1.5
+            w["e"] += 1.5
+        for w in words[17:]:
+            w["s"] += 1.0
+            w["e"] += 1.0
+        start, end = snap_clip_to_words(0.0, 95.0, words, 120.0)
+        assert end == pytest.approx(49.8 + 0.2)
+
+    def test_over_long_clip_falls_back_to_last_word_before_cap(self):
+        # Uniform gaps, no punctuation: the latest word end before the cap wins.
+        words = self._words()
+        start, end = snap_clip_to_words(0.0, 75.0, words, 80.0)
+        assert 59.0 <= end - start <= 60.0
+
+    def test_clip_within_band_ignores_sentence_rule(self):
+        words = self._words()
+        words[10]["w"] = " ponto."
+        start, end = snap_clip_to_words(0.0, 40.0, words, 80.0)
+        assert 39.6 <= end <= 40.05
+
 
 class TestPricing:
     def test_known_models(self):

@@ -325,6 +325,37 @@ def dedupe_overlapping(shorts, ratio=0.25):
     return [c for _, c in sorted(kept, key=lambda p: p[0])]
 
 
+_SENTENCE_END = (".", "!", "?", "…")
+
+
+def _cut_over_long_clip(start, words, min_duration, max_duration, tail=0.2):
+    """End time for a proposal longer than ``max_duration``.
+
+    Models routinely ignore the band and propose 90-100 s for a 60 s cap; cutting
+    on the last word before the cap then ends the clip mid-sentence. Prefer, in
+    order: the last sentence end that fits, the longest pause in the fitting
+    stretch, and only then the last word before the cap."""
+    target = start + max_duration
+    fitting = []
+    for i, w in enumerate(words):
+        e = float(w.get("e", 0))
+        if start < e <= target - tail:
+            nxt = float(words[i + 1].get("s", e)) if i + 1 < len(words) else e + 1.0
+            fitting.append((e, str(w.get("w", "")).strip(), max(0.0, nxt - e)))
+    if not fitting:
+        return target
+    long_enough = [f for f in fitting if f[0] - start >= min_duration]
+    sentences = [f for f in long_enough if f[1].endswith(_SENTENCE_END)]
+    if sentences:
+        return sentences[-1][0] + tail
+    if long_enough:
+        # Longest pause in the closing stretch (a pause at second 16 of a 60 s
+        # cap would throw most of the moment away); a tie goes to the later one.
+        late = [f for f in long_enough if f[0] - start >= 0.6 * max_duration] or long_enough
+        return max(late, key=lambda f: (round(f[2], 2), f[0]))[0] + tail
+    return fitting[-1][0] + tail
+
+
 def snap_clip_to_words(start, end, words, video_duration,
                        min_duration=15.0, max_duration=60.0,
                        search_window=1.5, max_lead=0.35, max_tail=0.45):
@@ -380,9 +411,7 @@ def snap_clip_to_words(start, end, words, video_duration,
         else:
             return original
     if new_end - new_start > max_duration:
-        target = new_start + max_duration
-        earlier = [e for e in ends if new_start < e <= target]
-        new_end = (max(earlier) + 0.2) if earlier else target
+        new_end = _cut_over_long_clip(new_start, words, min_duration, max_duration)
         new_end = min(new_end, new_start + max_duration, float(video_duration))
 
     if new_end <= new_start or new_end - new_start < min_duration:
