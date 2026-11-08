@@ -57,8 +57,13 @@ function loadHookPrefs() {
     try { return JSON.parse(localStorage.getItem('os_hook_prefs')) || {}; } catch { return {}; }
 }
 
-export default function HookModal({ isOpen, onClose, onGenerate, onRemove, isProcessing, videoUrl, initialText, durationInSeconds, existingSubtitles, hasCaptions, serverRender, burnedHook }) {
-    const prefs = loadHookPrefs();
+// `initial` (the clip editor): the hook the clip already carries, so the form
+// opens on it. `submitLabel` + `onTop` let the editor use this as a step of
+// its single render instead of an immediate one.
+export default function HookModal({ isOpen, onClose, onGenerate, onRemove, isProcessing, videoUrl, initialText, durationInSeconds, existingSubtitles, hasCaptions, serverRender, burnedHook, initial = null, submitLabel = null, onTop = false }) {
+    const prefs = { ...loadHookPrefs(), ...(initial ? {
+        pos: initial.position, size: initial.size, style: initial.style, font: initial.font,
+    } : {}) };
     const [text, setText] = useState(initialText || 'POV: You are using the viral hook feature');
     // Stored as `pos`, not `position`: before 'auto' existed every save wrote
     // 'top' whether or not the user ever touched the control.
@@ -69,7 +74,7 @@ export default function HookModal({ isOpen, onClose, onGenerate, onRemove, isPro
     const [font, setFont] = useState(prefs.font || null);
     const effectiveFont = font || styleFont(style);
     const [entranceAnimation, setEntranceAnimation] = useState(prefs.entranceAnimation || 'spring');
-    const [displayDuration, setDisplayDuration] = useState(5);
+    const [displayDuration, setDisplayDuration] = useState(initial?.duration_seconds || 5);
 
     if (!isOpen) return null;
 
@@ -107,7 +112,7 @@ export default function HookModal({ isOpen, onClose, onGenerate, onRemove, isPro
         + "@font-face{font-family:'Anton-Regular';src:url('/fonts/Anton-Regular.ttf') format('truetype');font-weight:400;}";
 
     return (
-        <Modal isOpen={isOpen} onClose={onClose} size="lg" eyebrow="EDITOR · HOOK" title="edit hook">
+        <Modal isOpen={isOpen} onClose={onClose} size="lg" eyebrow="EDITOR · HOOK" title="edit hook" onTop={onTop}>
             <style>{pillFontFace}</style>
             <div className="flex flex-col md:flex-row gap-6">
                 {/* Left: Preview */}
@@ -322,7 +327,7 @@ export default function HookModal({ isOpen, onClose, onGenerate, onRemove, isPro
                             className="btn-primary flex-1"
                         >
                             {isProcessing && <Loader2 size={16} className="animate-spin text-brassink" />}
-                            {isProcessing ? 'saving...' : (burnedHook ? 'update hook' : 'add hook')}
+                            {isProcessing ? 'saving...' : (submitLabel || (burnedHook ? 'update hook' : 'add hook'))}
                         </button>
                     </div>
                 </div>

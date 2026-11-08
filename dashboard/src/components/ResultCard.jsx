@@ -63,7 +63,7 @@ function formatDuration(clip) {
     return `${String(Math.floor(secs / 60)).padStart(2, '0')}:${String(secs % 60).padStart(2, '0')}`;
 }
 
-export default function ResultCard({ clip, index, jobId, durable, uploadPostKey, uploadUserId, geminiApiKey, elevenLabsKey, isManaged, onPlay, onPause, onBulkSubtitle, clipCount = 1, bulkProgress, initialState = null, onStateChange, connectedPlatforms = null, onConnectSocials, onEditClip = null, onReframeClip = null, onUpgrade = null }) {
+export default function ResultCard({ clip, index, jobId, durable, uploadPostKey, uploadUserId, geminiApiKey, elevenLabsKey, isManaged, onPlay, onPause, onBulkSubtitle, clipCount = 1, bulkProgress, initialState = null, onStateChange, connectedPlatforms = null, onConnectSocials, onEditClip = null, onReframeClip = null, onUpgrade = null, renderState = null }) {
     const [showModal, setShowModal] = useState(false);
     // The "why" line is clamped to two lines so cards in a row stay level;
     // when it overflows, a hover (desktop) or tap (touch) shows the whole
@@ -957,19 +957,37 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                     </div>
                 )}
 
+                {renderState?.status === 'rendering' && (
+                    <div className="mb-3 px-3 py-2 rounded-input text-xs text-ink2 bg-paper3 flex items-center gap-2 lowercase">
+                        <Loader2 size={14} className="shrink-0 animate-spin text-brass" />
+                        rendering your edit in the background; this card updates when it finishes
+                    </div>
+                )}
+                {renderState?.status === 'error' && (
+                    <div className="mb-3 px-3 py-2 rounded-input text-xs text-danger bg-[color-mix(in_oklab,var(--color-danger)_10%,transparent)] flex items-center gap-2">
+                        <AlertCircle size={14} className="shrink-0" />
+                        edit render failed: {renderState.message}
+                    </div>
+                )}
+
                 {/* Actions Footer */}
                 <div className="grid grid-cols-[repeat(auto-fill,minmax(104px,1fr))] gap-2 mt-auto pt-4 border-t border-rule">
                     {onEditClip && (
                         <button
                             onClick={() => onEditClip(index)}
+                            disabled={renderState?.status === 'rendering'}
                             className={QUIET_BTN}
+                            title="cut, framing, captions, hook and music in one render"
                         >
-                            <Scissors size={16} className="text-muted group-hover:text-brass transition-colors shrink-0" />
-                            edit clip
+                            {renderState?.status === 'rendering'
+                                ? <Loader2 size={16} className="animate-spin text-brass shrink-0" />
+                                : <Scissors size={16} className="text-muted group-hover:text-brass transition-colors shrink-0" />}
+                            {renderState?.status === 'rendering' ? 'rendering…' : 'edit'}
                         </button>
                     )}
 
-                    {onReframeClip && (
+                    {/* With the editor, framing/captions/hook live inside it. */}
+                    {onReframeClip && !onEditClip && (
                         <button
                             onClick={() => onReframeClip(index)}
                             className={QUIET_BTN}
@@ -988,6 +1006,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                         {isEditing ? 'editing…' : 'auto edit'}
                     </button>
 
+                    {!onEditClip && (<>
                     <button
                         onClick={() => setShowSubtitleModal(true)}
                         disabled={isSubtitling}
@@ -1005,6 +1024,7 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                         {isHooking ? <Loader2 size={16} className="animate-spin text-brass shrink-0" /> : <Wand2 size={16} className="text-muted group-hover:text-brass transition-colors shrink-0" />}
                         {isHooking ? 'saving…' : 'edit hook'}
                     </button>
+                    </>)}
 
                     <button
                         onClick={() => setShowTranslateModal(true)}

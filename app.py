@@ -46,7 +46,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # Configuration
 # Default to 1 if not set, but user can set higher for powerful servers
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "5"))
-MAX_FILE_SIZE_MB = 2048  # 2GB limit
+MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "2048"))  # 2GB default
 
 # How TikTok receives our uploads. MEDIA_UPLOAD lands the video in the user's
 # TikTok drafts so they finish the post inside TikTok's own editor; DIRECT_POST
@@ -1317,6 +1317,59 @@ def _recut_hooker(clip):
             return None
         return out if os.path.exists(out) else None
     return burn
+
+
+HOOK_FIELDS = ("text", "style", "font", "position", "size", "duration_seconds")
+
+
+def _edited_caption_words(words):
+    """Clip-relative ms caption words (CaptionWordIn) -> the seconds-based
+    words the generators burn verbatim, or None when nothing usable is left."""
+    if len(words) > 2000:
+        raise HTTPException(status_code=400, detail="Too many caption words (max 2000).")
+    # Leading space = Whisper's word-boundary convention; without it the
+    # block collector treats each word as a continuation fragment and
+    # glues the whole line together.
+    edited = [
+        {"word": " " + w.text.strip(), "start": max(0.0, w.startMs / 1000.0),
+         "end": max(0.0, w.endMs / 1000.0)}
+        for w in words if w.text.strip() and w.endMs > w.startMs >= 0
+    ]
+    return edited or None
+
+
+def _rerender_captioner(style, words, language):
+    """perform_recut's ``captioner`` for the unified editor: the chosen look,
+    and edited words (timed on the new cut) burned verbatim when given."""
+    if words:
+        wt = _words_transcript(words, language)
+        end = wt["segments"][0]["end"]
+        if style:
+            return lambda path, _t, _s, _e: _restyle_captions(path, wt, 0.0, end, style)
+        import main as _main
+        return lambda path, _t, _s, _e: _main.auto_caption_clip(path, wt, 0.0, end)
+    if style:
+        return lambda path, transcript, start, end: _restyle_captions(
+            path, transcript, start, end, style)
+    return None
+
+
+def _clip_music_settings(output_dir, clip):
+    """The job's background track as this clip uses it: (available, enabled,
+    volume). A clip can turn the track off or change its level in the editor."""
+    import background_music
+    job = background_music.job_music(output_dir)
+    own = clip.get('music') or {}
+    volume = own.get('volume', job[1] if job else background_music.DEFAULT_VOLUME)
+    return bool(job), own.get('enabled', True), background_music.clamp_volume(volume)
+
+
+def _clip_music(output_dir, clip):
+    """(path, volume) to mix under this clip's re-render, or None."""
+    import background_music
+    job = background_music.job_music(output_dir)
+    _, enabled, volume = _clip_music_settings(output_dir, clip)
+    return (job[0], volume) if job and enabled else None
 
 
 def _recover_jobs_from_disk():
@@ -4034,6 +4087,7 @@ async def process_endpoint(
             while content := await file.read(1024 * 1024): # Read 1MB chunks
                 size += len(content)
                 if size > limit_bytes:
+                    buffer.close()  # Windows can't remove an open file
                     os.remove(input_path)
                     shutil.rmtree(job_output_dir)
                     raise HTTPException(status_code=413, detail=f"File too large. Max size {MAX_FILE_SIZE_MB}MB")
@@ -5004,6 +5058,12 @@ async def get_clip_edl(job_id: str, clip_index: int, request: Request):
             "max_total_seconds": recut.MAX_TOTAL_SECONDS,
         },
         "rerender_minutes": _cloud_config.EDITOR_ACTION_MINUTES if BILLING_ENABLED else 0,
+        # What the unified editor shows as the clip's current layers.
+        "hook": clip.get('auto_hook') or None,
+        "caption_style": clip.get('caption_style') or None,
+        "caption_words_edited": bool(clip.get('caption_words')),
+        "music": dict(zip(("available", "enabled", "volume"),
+                          _clip_music_settings(output_dir, clip))),
     }
 
 
@@ -5021,6 +5081,14 @@ class RerenderRequest(BaseModel):
     # None = inherit the recipe's framing (so plain trims keep the look);
     # 'auto' resets to the classifier; 'full'/'track' force a layout.
     framing: Optional[str] = None
+    # Unified editor: every layer goes into this one render. None = keep what
+    # the clip has. caption_words are timed on the NEW cut (clip-relative ms).
+    caption_style: Optional[Dict[str, Any]] = None
+    caption_words: Optional[List[CaptionWordIn]] = None
+    hook: Optional[Dict[str, Any]] = None
+    remove_hook: bool = False
+    music_enabled: Optional[bool] = None
+    music_volume: Optional[float] = None
 
 
 # Manual framing -> reframe-engine strategy. 'full' shows the whole source
@@ -5117,12 +5185,39 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
     except recut.RecutError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    import background_music
+    caption_style = ({k: v for k, v in req.caption_style.items() if k in CAPTION_STYLE_FIELDS}
+                     if req.caption_style else clip.get('caption_style'))
+    caption_words = _edited_caption_words(req.caption_words) if req.caption_words else None
+    if req.remove_hook:
+        hook = None
+    elif req.hook and (req.hook.get('text') or '').strip():
+        hook = {k: req.hook.get(k) for k in HOOK_FIELDS}
+    else:
+        hook = clip.get('auto_hook') or None
+    music_settings = dict(clip.get('music') or {})
+    if req.music_enabled is not None:
+        music_settings['enabled'] = bool(req.music_enabled)
+    if req.music_volume is not None:
+        music_settings['volume'] = background_music.clamp_volume(req.music_volume)
+    music_clip = {**clip, 'music': music_settings}
+    music = _clip_music(output_dir, music_clip)
+    has_job_music = background_music.job_music(output_dir) is not None
+    clean_canonical = background_music.clean_copy_path(canonical_path)
+    have_clean = os.path.exists(clean_canonical)
+    # The canonical file already carries the music. Without its music-free
+    # copy (jobs from before it existed) a fast recut keeps the baked bed, so
+    # turning the music off or changing its level needs the source.
+    music_changed = (_clip_music_settings(output_dir, clip)[1:]
+                     != _clip_music_settings(output_dir, music_clip)[1:])
+
     # A framing override always re-reframes from the source: the canonical file
     # has the old layout baked into its pixels.
     fast = (force_strategy is None
             and os.path.exists(canonical_path)
             and recut.within_range(segments, canonical_range['start'],
-                                   canonical_range['end']))
+                                   canonical_range['end'])
+            and not (has_job_music and not have_clean and music_changed and source_path))
     if not fast and not source_path:
         raise HTTPException(
             status_code=409,
@@ -5139,31 +5234,33 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
     v_transcript = (recut.virtual_transcript(transcript, segments)
                     if req.reapply_captions else None)
 
-    import background_music
-    music = background_music.job_music(output_dir)
-    clean_canonical = background_music.clean_copy_path(canonical_path)
-    # The canonical file already carries the music: without its music-free
-    # copy (jobs from before it existed) the fast path keeps the baked bed.
-    fast_music = music if os.path.exists(clean_canonical) else None
+    captioner = _rerender_captioner(caption_style, caption_words,
+                                    transcript.get('language', 'en'))
+    print(f"[rerender] job={req.job_id} clip={req.clip_index} path={'fast' if fast else 'source'} "
+          f"captions={'on' if req.reapply_captions else 'off'} "
+          f"style={'new' if req.caption_style else ('kept' if caption_style else 'default')} "
+          f"words={len(caption_words or [])} hook={'removed' if req.remove_hook else ('new' if req.hook else ('kept' if hook else 'none'))} "
+          f"music={music[1] if music else 'off'}")
+    hooker = _recut_hooker({'auto_hook': hook})
 
     def run_recut():
         if fast:
             return recut.perform_recut(
                 input_path=canonical_path,
-                cut_from=clean_canonical if fast_music else None,
-                music=fast_music,
+                cut_from=clean_canonical if has_job_music and have_clean else None,
+                music=music if have_clean else None,
                 segments=recut.rebase_segments(
                     segments, canonical_range['start'], canonical_range['end']),
                 output_dir=output_dir, clean_name=clean_name,
                 reframe=False, captions_transcript=v_transcript,
-                captioner=_recut_captioner(clip), hooker=_recut_hooker(clip))
+                captioner=captioner, hooker=hooker)
         return recut.perform_recut(
             input_path=source_path, segments=segments,
             output_dir=output_dir, clean_name=clean_name,
             reframe=True, output_format=data.get('output_format', 'auto'),
             force_strategy=force_strategy, music=music,
             captions_transcript=v_transcript,
-            captioner=_recut_captioner(clip), hooker=_recut_hooker(clip),
+            captioner=captioner, hooker=hooker,
             # Trim the source's own subtitles only when ours go back on.
             subtitle_band=(data.get('source_subtitle_band')
                            if v_transcript else None))
@@ -5197,10 +5294,18 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
         if clip.get('crop_overrides'):
             updates['crop_overrides'] = None
         # Edited caption words are timed against the previous cut; the new one
-        # captions from the transcript (in the recorded style, if any).
-        if clip.get('caption_words'):
-            updates['caption_words'] = None
+        # captions from the transcript (in the recorded style, if any) unless
+        # the editor sent words timed on this cut.
+        if caption_words or clip.get('caption_words'):
+            updates['caption_words'] = caption_words
+        if caption_style:
+            updates['caption_style'] = caption_style
+        updates['auto_hook'] = hook
+        if music_settings:
+            updates['music'] = music_settings
         clip.update(updates)
+        if not hook:
+            clip.pop('auto_hook', None)
         data['shorts'] = clips
         write_json_atomic(json_files[0], data, indent=2)
         mem_clips = (job.get('result') or {}).get('clips') or []
@@ -5219,6 +5324,8 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
             "end": new_end,
             "duration": total,
             "render_path": "fast" if fast else "source",
+            "hook": hook,
+            "caption_style": caption_style,
         }
     except Exception as e:
         if reservation_id:
@@ -5524,7 +5631,6 @@ async def _reframe_locked(req: ReframeRequest, request: Request, job, overrides)
     # and captioning and the path blew past the filesystem limit:
     # "Error opening output ...: File name too long".
     clean_name = f"{base_name}_clip_{req.clip_index + 1}.mp4"
-    import background_music
 
     def run():
         return recut.perform_recut(
@@ -5533,7 +5639,7 @@ async def _reframe_locked(req: ReframeRequest, request: Request, job, overrides)
             reframe=True, output_format=data.get('output_format', 'auto'),
             force_strategy=force_strategy,
             crop_overrides=overrides,
-            music=background_music.job_music(output_dir),
+            music=_clip_music(output_dir, clip),
             captions_transcript=v_transcript,
             captioner=_recut_captioner(clip), hooker=_recut_hooker(clip),
             # Trim the source's own subtitles only when ours go back on.
@@ -5851,16 +5957,7 @@ async def add_subtitles(req: SubtitleRequest, request: Request):
     # verbatim (issue #69 — edits used to be dropped on this path).
     caption_words = None
     if req.words:
-        if len(req.words) > 2000:
-            raise HTTPException(status_code=400, detail="Too many caption words (max 2000).")
-        # Leading space = Whisper's word-boundary convention; without it the
-        # block collector treats each word as a continuation fragment and
-        # glues the whole line together.
-        edited = [
-            {"word": " " + w.text.strip(), "start": max(0.0, w.startMs / 1000.0),
-             "end": max(0.0, w.endMs / 1000.0)}
-            for w in req.words if w.text.strip() and w.endMs > w.startMs >= 0
-        ]
+        edited = _edited_caption_words(req.words)
         if edited:
             sub_transcript = _words_transcript(
                 edited, (transcript or {}).get("language", "en"))

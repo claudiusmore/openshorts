@@ -12,6 +12,7 @@ import { X } from 'lucide-react';
  *  - children: body content
  *  - footer: optional node pinned under the body
  *  - hideClose: hide the X button
+ *  - onTop: stack above the full-screen clip editor (z-110)
  */
 const SIZES = {
   sm: 'max-w-sm',
@@ -20,7 +21,7 @@ const SIZES = {
   xl: 'max-w-5xl',
 };
 
-export default function Modal({ isOpen, onClose, title, eyebrow, size = 'md', children, footer, hideClose = false }) {
+export default function Modal({ isOpen, onClose, title, eyebrow, size = 'md', children, footer, hideClose = false, onTop = false }) {
   if (!isOpen) return null;
 
   return (
@@ -28,7 +29,7 @@ export default function Modal({ isOpen, onClose, title, eyebrow, size = 'md', ch
        run taller than a centred dialog whose 4px side margins wasted the only
        width there was. From sm up it is the centred dialog it always was. */
     <div
-      className="fixed inset-0 z-[100] flex items-end sm:items-center justify-center bg-black/70 p-0 sm:p-4 animate-fade"
+      className={`fixed inset-0 ${onTop ? 'z-[120]' : 'z-[100]'} flex items-end sm:items-center justify-center bg-black/70 p-0 sm:p-4 animate-fade`}
       onMouseDown={(e) => { if (e.target === e.currentTarget && onClose) onClose(); }}
       role="dialog"
       aria-modal="true"

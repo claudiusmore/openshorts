@@ -16,12 +16,16 @@ export const ShortVideo: React.FC<Record<string, unknown>> = (rawProps) => {
   return (
     <AbsoluteFill style={{ backgroundColor: "#000" }}>
       {/* Layer 1: Base video with optional zoom/color effects */}
-      <VideoEffects config={effects}>
-        <Video
-          src={videoUrl}
-          style={{ width: "100%", height: "100%", objectFit: "cover" }}
-        />
-      </VideoEffects>
+      {/* No video = layers over black (the clip editor previews a cut that
+          is not rendered yet). */}
+      {videoUrl && (
+        <VideoEffects config={effects}>
+          <Video
+            src={videoUrl}
+            style={{ width: "100%", height: "100%", objectFit: "cover" }}
+          />
+        </VideoEffects>
+      )}
 
       {/* Layer 2: Animated subtitles */}
       {subtitles && <Subtitles config={subtitles} />}

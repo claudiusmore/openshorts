@@ -345,3 +345,55 @@ class TestMcpTool:
         names = [t["name"] for t in mcp_server.TOOLS]
         assert "recut_clip" in names
         assert "recut_clip" in mcp_server._TOOL_IMPLS
+
+
+class TestUnifiedEdit:
+    """The unified editor sends every layer with the one re-render."""
+
+    BODY = {"job_id": JOB_ID, "clip_index": 0,
+            "segments": [{"start": 12, "end": 30}]}
+
+    def test_hook_style_words_and_music_land_on_the_clip(self, job, fake_recut):
+        (job["dir"] / "background_music.mp3").write_bytes(b"music")
+        (job["dir"] / "background_music.json").write_text(
+            json.dumps({"file": "background_music.mp3", "volume": 0.15}))
+        (job["dir"] / "mytitle_clip_1.mp4.nomusic").write_bytes(b"clean")
+        resp = _request("POST", "/api/clip/rerender", {
+            **self.BODY,
+            "caption_style": {"style": "karaoke", "font_size": 40, "bogus": 1},
+            "caption_words": [{"text": "hi", "startMs": 0, "endMs": 400}],
+            "hook": {"text": "WAIT FOR IT", "style": "pill", "size": "L"},
+            "music_volume": 0.3,
+        })
+        assert resp.status_code == 200
+        call = fake_recut[-1]
+        assert call["cut_from"].endswith(".nomusic")
+        assert call["music"][1] == 0.3
+        assert call["hooker"] is not None and call["captioner"] is not None
+
+        stored = json.loads(job["meta_path"].read_text())["shorts"][0]
+        assert stored["caption_style"] == {"style": "karaoke", "font_size": 40}
+        assert [w["word"] for w in stored["caption_words"]] == [" hi"]
+        assert stored["auto_hook"]["text"] == "WAIT FOR IT"
+        assert stored["auto_hook"]["size"] == "L"
+        assert stored["music"] == {"volume": 0.3}
+
+        edl = _request("GET", f"/api/clip/{JOB_ID}/0/edl").json()
+        assert edl["hook"]["text"] == "WAIT FOR IT"
+        assert edl["music"] == {"available": True, "enabled": True, "volume": 0.3}
+
+    def test_remove_hook_and_music_off(self, job, fake_recut):
+        meta = json.loads(job["meta_path"].read_text())
+        meta["shorts"][0]["auto_hook"] = {"text": "OLD"}
+        job["meta_path"].write_text(json.dumps(meta))
+        (job["dir"] / "background_music.mp3").write_bytes(b"music")
+        resp = _request("POST", "/api/clip/rerender", {
+            **self.BODY, "remove_hook": True, "music_enabled": False})
+        assert resp.status_code == 200
+        call = fake_recut[-1]
+        assert call["hooker"] is None and call["music"] is None
+        # No music-free copy: turning the music off needs the source path.
+        assert resp.json()["render_path"] == "source"
+        stored = json.loads(job["meta_path"].read_text())["shorts"][0]
+        assert "auto_hook" not in stored
+        assert stored["music"] == {"enabled": False}

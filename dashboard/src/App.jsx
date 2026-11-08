@@ -398,6 +398,15 @@ function App() {
   // Clip editor overlay: index of the clip being edited, or null.
   const [editingClip, setEditingClip] = useState(null);
   const [reframingClip, setReframingClip] = useState(null);
+  // `${jobId}:${index}` -> { status: 'rendering' | 'error', message } for
+  // editor renders that keep going after the editor is closed.
+  const [clipRenders, setClipRenders] = useState({});
+  const handleClipRenderState = (forJob, index, st) => setClipRenders((prev) => {
+    const next = { ...prev };
+    if (st) next[`${forJob}:${index}`] = st;
+    else delete next[`${forJob}:${index}`];
+    return next;
+  });
 
   // Silent-success "saved" states for the settings key inputs (design.md: no alert popups)
   const [elevenLabsSaved, setElevenLabsSaved] = useState(false);
@@ -575,6 +584,8 @@ function App() {
         start: data.start,
         end: data.end,
         recipe: data.recipe,
+        ...('hook' in data ? { auto_hook: data.hook } : {}),
+        ...('caption_style' in data ? { caption_style: data.caption_style } : {}),
       };
       return { ...prev, clips };
     });
@@ -2575,6 +2586,7 @@ function App() {
                           jobId={jobId}
                           onEditClip={(index) => setEditingClip(index)}
                           onReframeClip={(index) => setReframingClip(index)}
+                          renderState={clipRenders[`${jobId}:${i}`] || null}
                           onUpgrade={isManaged ? openUpsell : null}
                           initialState={projectState?.clips?.find((c) => c.index === i) || null}
                           onStateChange={handleClipStateChange}
@@ -2759,7 +2771,12 @@ function App() {
           clipIndex={editingClip}
           clipTitle={results.clips[editingClip].video_title_for_youtube_short || ''}
           onClose={() => setEditingClip(null)}
-          onRerendered={handleClipRerendered}
+          onRerendered={((forJob) => (index, data) => {
+            // The render may land after the user moved to another project.
+            if (jobIdRef.current === forJob) handleClipRerendered(index, data);
+          })(jobId)}
+          onRenderState={((forJob) => (index, st) => handleClipRenderState(forJob, index, st))(jobId)}
+          onOpenReframe={() => { setReframingClip(editingClip); setEditingClip(null); }}
         />
       )}
       {reframingClip !== null && results?.clips?.[reframingClip] && (

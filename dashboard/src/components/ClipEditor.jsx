@@ -2,8 +2,10 @@ import React, { useState, useEffect, useReducer, useRef, useCallback, useMemo, u
 import {
     X, Loader2, Plus, Trash2, ChevronUp, ChevronDown, Scissors,
     AlertCircle, Undo2, Redo2, ChevronsRight, ChevronsLeft,
-    PanelLeft, PanelLeftClose, Film,
+    PanelLeft, PanelLeftClose, Film, Type, Music, Crosshair, Wand2,
 } from 'lucide-react';
+import SubtitleModal from './SubtitleModal';
+import HookModal from './HookModal';
 import { getApiUrl, withParam } from '../config';
 import { apiFetch, apiJson, QuotaError, openQuotaWall } from '../lib/api';
 import { useAuth } from '../contexts/AuthContext';
@@ -11,6 +13,69 @@ import { useAuth } from '../contexts/AuthContext';
 // Full-screen clip editor: shows WHICH source segments a clip was cut from,
 // lets the user trim/extend/split/reorder them (word-snapped), and re-renders
 // through POST /api/clip/rerender. The recipe (EDL) comes from GET .../edl.
+// Captions, hook and background music are edited here too and go into that
+// same single render.
+
+// SubtitleModal options -> the caption look /api/clip/rerender records
+// (app.py CAPTION_STYLE_FIELDS), same mapping the card's /api/subtitle call uses.
+function toCaptionStyle(o) {
+    return {
+        position: o.position, font_size: o.fontSize, font_name: o.fontName,
+        font_color: o.fontColor, border_color: o.borderColor, border_width: o.borderWidth,
+        bg_color: o.bgColor, bg_opacity: o.bgOpacity, style: o.style || 'classic',
+        highlight_color: o.highlightColor || '#FFD700', effect: o.effect || 'none',
+        base_opacity: o.baseOpacity ?? 1.0, uppercase: o.uppercase || false,
+        reveal: o.reveal || false, shadow: o.shadow || 0,
+        max_chars: o.maxChars ?? null, max_duration: o.maxDuration ?? null,
+    };
+}
+
+// The clip's file without its burned captions/hook, for the modal previews
+// (they draw their own layer on top).
+function stripBurns(name) {
+    let f = name || '';
+    let prev;
+    do {
+        prev = f;
+        f = f.replace(/^subtitled_\d+_/, '').replace(/^hooked_\d+_/, '').replace(/^hook_/, '');
+    } while (f !== prev);
+    return f;
+}
+
+const cutKey = (segs) => (segs || []).map((x) => `${x.start}-${x.end}`).join('|');
+
+// The caption words of a cut that may not be rendered yet: source words laid
+// onto the clip timeline segment by segment (recut.virtual_transcript), in the
+// {text, startMs, endMs} shape of GET /api/clip/.../transcript.
+function cutCaptions(words, segs) {
+    const out = [];
+    let offset = 0;
+    for (const seg of segs) {
+        for (const w of words) {
+            if (w.e > seg.start && w.s < seg.end) {
+                out.push({
+                    text: (w.w || '').trim(),
+                    startMs: Math.round((Math.max(w.s, seg.start) - seg.start + offset) * 1000),
+                    endMs: Math.round((Math.min(w.e, seg.end) - seg.start + offset) * 1000),
+                });
+            }
+        }
+        offset += seg.end - seg.start;
+    }
+    return out.filter((c) => c.text && c.endMs > c.startMs);
+}
+
+function Switch({ checked, onChange, label, disabled = false }) {
+    return (
+        <label className={`flex items-center justify-between gap-3 ${disabled ? 'opacity-45' : 'cursor-pointer'}`}>
+            <span className="text-xs lowercase text-ink2">{label}</span>
+            <span className="relative inline-flex items-center">
+                <input type="checkbox" checked={checked} disabled={disabled} onChange={(e) => onChange(e.target.checked)} className="sr-only peer" />
+                <span className="w-8 h-4 rounded-full bg-paper3 peer-checked:bg-brass transition-colors after:content-[''] after:absolute after:left-0.5 after:top-0.5 after:w-3 after:h-3 after:rounded-full after:bg-ink after:transition-transform peer-checked:after:translate-x-4" />
+            </span>
+        </label>
+    );
+}
 
 const MIN_SEGMENT_SECONDS = 0.5;
 const SNAP_WINDOW_SECONDS = 0.35;
@@ -95,7 +160,7 @@ function editorReducer(state, action) {
     }
 }
 
-export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRerendered }) {
+export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRerendered, onRenderState, onOpenReframe }) {
     const { refreshMe } = useAuth();
     const [edl, setEdl] = useState(null);
     const [loadError, setLoadError] = useState(null);
@@ -104,6 +169,17 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
 
     const [snapToWords, setSnapToWords] = useState(true);
     const [reapplyCaptions, setReapplyCaptions] = useState(true);
+    const [renderedCaptions, setRenderedCaptions] = useState(true);
+    // Layer drafts, applied by the next render. captionDraft = SubtitleModal
+    // options; its edited words are timed on the cut in captionDraftCut.
+    // hookDraft: undefined = keep the clip's hook, null = remove it.
+    const [captionDraft, setCaptionDraft] = useState(null);
+    const [captionDraftCut, setCaptionDraftCut] = useState('');
+    const [hookDraft, setHookDraft] = useState(undefined);
+    const [musicEnabled, setMusicEnabled] = useState(true);
+    const [musicVolume, setMusicVolume] = useState(0.15);
+    const [showCaptionModal, setShowCaptionModal] = useState(false);
+    const [showHookModal, setShowHookModal] = useState(false);
     // Framing override: 'auto' (classifier) | 'full' (whole frame) | 'track'.
     const [framing, setFraming] = useState('auto');
     const [renderedFraming, setRenderedFraming] = useState('auto');
@@ -190,7 +266,10 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
                 setRenderedSegments(data.segments.map((s) => ({ ...s })));
                 setFraming(data.framing || 'auto');
                 setRenderedFraming(data.framing || 'auto');
-                setReapplyCaptions(true);
+                setReapplyCaptions(data.has_captions ?? true);
+                setRenderedCaptions(data.has_captions ?? true);
+                setMusicEnabled(data.music?.enabled ?? true);
+                setMusicVolume(data.music?.volume ?? 0.15);
                 setPreviewUrl(getApiUrl(`/videos/${jobId}/${data.current_file}`));
             } catch (e) {
                 if (!cancelled) setLoadError(e.detail || e.message || 'could not load the clip recipe');
@@ -212,11 +291,30 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
     const sourceOpen = sourceAvailable && showSource;
 
     const total = totalOf(segments);
+    const music = edl?.music || { available: false, enabled: true, volume: 0.15 };
+    const musicDirty = music.available
+        && (musicEnabled !== music.enabled || Math.abs(musicVolume - music.volume) > 0.001);
+    const layersDirty = !!captionDraft || hookDraft !== undefined
+        || reapplyCaptions !== renderedCaptions || musicDirty;
     const dirty = useMemo(() => {
         if (!renderedSegments) return false;
         return JSON.stringify(segments) !== JSON.stringify(renderedSegments)
-            || framing !== renderedFraming;
-    }, [segments, renderedSegments, framing, renderedFraming]);
+            || framing !== renderedFraming || layersDirty;
+    }, [segments, renderedSegments, framing, renderedFraming, layersDirty]);
+    // Edited caption words are timed on the cut they were edited against.
+    const wordsStale = !!captionDraft?.captions && cutKey(segments) !== captionDraftCut;
+    const currentHook = hookDraft === undefined ? (edl?.hook || null) : hookDraft;
+    // Modal previews: the clean rendered clip while the cut is the rendered
+    // one; once the cut changed that file no longer matches, so the layers are
+    // previewed over black on the new timeline.
+    const cutChanged = cutKey(segments) !== cutKey(renderedSegments);
+    const previewBase = edl && !cutChanged
+        ? getApiUrl(`/videos/${jobId}/${stripBurns(edl.current_file)}`) : '';
+    const hookPreview = currentHook?.text ? {
+        text: currentHook.text, position: currentHook.position === 'auto' ? 'top' : (currentHook.position || 'top'),
+        size: currentHook.size || 'M', style: currentHook.style || 'pill', font: currentHook.font,
+        entranceAnimation: 'none', displayDurationSec: currentHook.duration_seconds || 5,
+    } : null;
 
     // Trim bounds: with the source gone, cuts must stay inside the range the
     // canonical file was rendered from.
@@ -788,6 +886,7 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
     // ---- keyboard -----------------------------------------------------------
     useEffect(() => {
         const onKey = (e) => {
+            if (showCaptionModal || showHookModal) return;   // the modal owns the keys
             const tag = (e.target?.tagName || '').toLowerCase();
             const typing = tag === 'input' || tag === 'textarea' || tag === 'select';
             if (e.key === 'Escape') {
@@ -843,6 +942,9 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
         if (!canRender) return;
         setRendering(true);
         setRenderError(null);
+        onRenderState?.(clipIndex, { status: 'rendering' });
+        const sentMusic = { enabled: musicEnabled, volume: musicVolume };
+        const sentCaptions = reapplyCaptions;
         try {
             const res = await apiFetch('/api/clip/rerender', {
                 method: 'POST',
@@ -854,6 +956,10 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
                     snap_to_words: false, // boundaries are already word-snapped client-side
                     reapply_captions: reapplyCaptions,
                     framing,
+                    ...(captionDraft ? { caption_style: toCaptionStyle(captionDraft) } : {}),
+                    ...(captionDraft?.captions && !wordsStale ? { caption_words: captionDraft.captions } : {}),
+                    ...(hookDraft === null ? { remove_hook: true } : hookDraft ? { hook: hookDraft } : {}),
+                    ...(music.available ? { music_enabled: musicEnabled, music_volume: musicVolume } : {}),
                 }),
             });
             if (!res.ok) {
@@ -867,9 +973,21 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
             setFraming(data.framing || 'auto');
             dispatch({ type: 'init', segments: data.recipe.segments.map((s) => ({ ...s })) });
             setPreviewUrl(withParam(getApiUrl(data.new_video_url), 't', Date.now()));
+            setEdl((prev) => (prev ? {
+                ...prev,
+                current_file: data.new_video_url.split('/').pop(),
+                hook: data.hook || null,
+                caption_style: data.caption_style || null,
+                music: { ...prev.music, ...sentMusic },
+            } : prev));
+            setCaptionDraft(null);
+            setHookDraft(undefined);
+            setRenderedCaptions(sentCaptions);
             onRerendered?.(clipIndex, data);
+            onRenderState?.(clipIndex, null);
             refreshMe();
         } catch (e) {
+            onRenderState?.(clipIndex, { status: 'error', message: e.message || 're-render failed' });
             if (e instanceof QuotaError) {
                 refreshMe();
                 setRenderError(`not enough minutes left (needs ${e.minutesRequired ?? '?'}, ${e.minutesRemaining ?? 0} remaining)`);
@@ -1097,7 +1215,7 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
             <div className="px-4 sm:px-6 pt-4 pb-3 border-b border-rule flex items-start justify-between gap-4 shrink-0">
                 <div className="min-w-0">
                     <p className="eyebrow mb-1">EDITOR · CLIP {clipIndex + 1}</p>
-                    <h2 className="font-display lowercase text-xl sm:text-2xl text-ink truncate">edit clip</h2>
+                    <h2 className="font-display lowercase text-xl sm:text-2xl text-ink truncate">edit short</h2>
                     {clipTitle && <p className="text-xs text-muted truncate mt-0.5">{clipTitle}</p>}
                     {/* Phone: the readouts move under the title — as a third
                         column they squeezed the title to two characters. */}
@@ -1505,7 +1623,105 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
                                     changing the framing re-runs the reframe engine (slower than a fast recut)
                                 </p>
                             )}
+                            {onOpenReframe && sourceAvailable && (
+                                <>
+                                    <button
+                                        type="button"
+                                        onClick={onOpenReframe}
+                                        disabled={dirty || rendering}
+                                        className="mt-2 w-full flex items-center justify-center gap-1.5 py-1.5 rounded-input border border-rule2 text-xs lowercase text-ink2 hover:bg-paper3 transition-colors disabled:opacity-45"
+                                    >
+                                        <Crosshair size={13} /> adjust framing scene by scene
+                                    </button>
+                                    <p className="text-[11px] text-muted mt-1 leading-relaxed">
+                                        {dirty
+                                            ? 'render your changes first: scene framing works on the rendered cut'
+                                            : 'opens the scene framer, which renders on its own'}
+                                    </p>
+                                </>
+                            )}
                         </div>
+
+                        {/* captions */}
+                        <div>
+                            <p className="eyebrow mb-2 flex items-center gap-1.5"><Type size={12} /> Captions</p>
+                            <Switch label="captions on" checked={reapplyCaptions} onChange={setReapplyCaptions} />
+                            <button
+                                type="button"
+                                onClick={() => setShowCaptionModal(true)}
+                                disabled={!reapplyCaptions}
+                                className="mt-2 w-full py-1.5 rounded-input border border-rule2 text-xs lowercase text-ink2 hover:bg-paper3 transition-colors disabled:opacity-45"
+                            >
+                                style &amp; text
+                            </button>
+                            {captionDraft && (
+                                <p className="text-[11px] text-muted mt-1.5 leading-relaxed">
+                                    new look{captionDraft.captions ? ' and edited text' : ''} goes in with the render ·{' '}
+                                    <button type="button" className="underline underline-offset-2 hover:text-ink2" onClick={() => setCaptionDraft(null)}>undo</button>
+                                </p>
+                            )}
+                            {wordsStale && (
+                                <p className="text-[11px] text-warn mt-1.5 leading-relaxed">
+                                    the cut changed after the text edit, so the captions come from the
+                                    transcript; edit the text again after this render
+                                </p>
+                            )}
+                        </div>
+
+                        {/* hook */}
+                        <div>
+                            <p className="eyebrow mb-2 flex items-center gap-1.5"><Wand2 size={12} /> Hook</p>
+                            <p className="text-xs text-ink2 break-words">
+                                {currentHook?.text ? `"${currentHook.text}"` : <span className="text-muted">no hook</span>}
+                            </p>
+                            <div className="flex gap-2 mt-2">
+                                <button
+                                    type="button"
+                                    onClick={() => setShowHookModal(true)}
+                                    className="flex-1 py-1.5 rounded-input border border-rule2 text-xs lowercase text-ink2 hover:bg-paper3 transition-colors"
+                                >
+                                    {currentHook ? 'edit hook' : 'add hook'}
+                                </button>
+                                {currentHook && (
+                                    <button
+                                        type="button"
+                                        onClick={() => setHookDraft(null)}
+                                        className="py-1.5 px-3 rounded-input border border-rule2 text-xs lowercase text-muted hover:text-danger hover:bg-paper3 transition-colors"
+                                    >
+                                        remove
+                                    </button>
+                                )}
+                            </div>
+                            {hookDraft !== undefined && (
+                                <p className="text-[11px] text-muted mt-1.5 leading-relaxed">
+                                    {hookDraft ? 'new hook' : 'hook removal'} goes in with the render ·{' '}
+                                    <button type="button" className="underline underline-offset-2 hover:text-ink2" onClick={() => setHookDraft(undefined)}>undo</button>
+                                </p>
+                            )}
+                        </div>
+
+                        {/* background music */}
+                        {music.available && (
+                            <div>
+                                <p className="eyebrow mb-2 flex items-center gap-1.5"><Music size={12} /> Music</p>
+                                <Switch label="background music" checked={musicEnabled} onChange={setMusicEnabled} />
+                                <div className={`mt-2 ${musicEnabled ? '' : 'opacity-45'}`}>
+                                    <div className="flex items-center justify-between mb-1">
+                                        <span className="text-xs lowercase text-ink2">volume</span>
+                                        <span className="readout">{Math.round(musicVolume * 100)}%</span>
+                                    </div>
+                                    <input
+                                        type="range"
+                                        min="5"
+                                        max="50"
+                                        value={Math.round(musicVolume * 100)}
+                                        disabled={!musicEnabled}
+                                        onChange={(e) => setMusicVolume(parseInt(e.target.value, 10) / 100)}
+                                        className="w-full accent-[var(--color-accent)]"
+                                    />
+                                </div>
+                            </div>
+                        )}
 
                         {/* toggles */}
                         <div className="space-y-2.5">
@@ -1513,13 +1729,6 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
                                 <span className="text-xs lowercase text-ink2">snap cuts to words</span>
                                 <span className="relative inline-flex items-center">
                                     <input type="checkbox" checked={snapToWords} onChange={(e) => setSnapToWords(e.target.checked)} className="sr-only peer" />
-                                    <span className="w-8 h-4 rounded-full bg-paper3 peer-checked:bg-brass transition-colors after:content-[''] after:absolute after:left-0.5 after:top-0.5 after:w-3 after:h-3 after:rounded-full after:bg-ink after:transition-transform peer-checked:after:translate-x-4" />
-                                </span>
-                            </label>
-                            <label className="flex items-center justify-between cursor-pointer">
-                                <span className="text-xs lowercase text-ink2">re-apply captions after recut</span>
-                                <span className="relative inline-flex items-center">
-                                    <input type="checkbox" checked={reapplyCaptions} onChange={(e) => setReapplyCaptions(e.target.checked)} className="sr-only peer" />
                                     <span className="w-8 h-4 rounded-full bg-paper3 peer-checked:bg-brass transition-colors after:content-[''] after:absolute after:left-0.5 after:top-0.5 after:w-3 after:h-3 after:rounded-full after:bg-ink after:transition-transform peer-checked:after:translate-x-4" />
                                 </span>
                             </label>
@@ -1558,7 +1767,7 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
                             <button className="btn-primary flex-1 flex items-center justify-center gap-2" disabled={!canRender || !dirty} onClick={doRender}>
                                 {rendering
                                     ? (<><Loader2 size={16} className="animate-spin text-brassink" /> re-rendering… {renderSeconds}s</>)
-                                    : (needsSourcePath ? 're-render from source' : 're-render clip')}
+                                    : (needsSourcePath ? 're-render from source' : 'render short')}
                             </button>
                         </div>
                         {rendering && (
@@ -1569,6 +1778,48 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
                     </div>
                 </div>
             </div>
+
+            {showCaptionModal && (
+                <SubtitleModal
+                    isOpen
+                    onTop
+                    onClose={() => setShowCaptionModal(false)}
+                    onGenerate={(options) => {
+                        setCaptionDraft(options);
+                        setCaptionDraftCut(cutKey(segments));
+                        setShowCaptionModal(false);
+                    }}
+                    isProcessing={false}
+                    videoUrl={previewBase}
+                    jobId={jobId}
+                    clipIndex={clipIndex}
+                    captionsOverride={{ captions: cutCaptions(words, segments), durationSec: total }}
+                    existingHook={hookPreview}
+                    submitLabel="use in the render"
+                />
+            )}
+            {showHookModal && (
+                <HookModal
+                    isOpen
+                    onTop
+                    serverRender
+                    onClose={() => setShowHookModal(false)}
+                    onGenerate={(p) => {
+                        setHookDraft({
+                            text: p.text, style: p.style, font: p.font, position: p.position,
+                            size: p.size, duration_seconds: p.remotion?.displayDurationSec ?? null,
+                        });
+                        setShowHookModal(false);
+                    }}
+                    isProcessing={false}
+                    videoUrl={previewBase}
+                    initialText={currentHook?.text}
+                    initial={currentHook}
+                    durationInSeconds={total}
+                    hasCaptions={reapplyCaptions}
+                    submitLabel="use in the render"
+                />
+            )}
         </div>
     );
 }

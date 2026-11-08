@@ -115,7 +115,7 @@ const swatchClass = (selected) =>
         ? 'ring-2 ring-[color:var(--color-accent)] ring-offset-2 ring-offset-[color:var(--color-paper-2)]'
         : 'ring-1 ring-[color:var(--color-rule-2)] hover:ring-[color:var(--color-accent)]'}`;
 
-export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll, onRemove, isProcessing, videoUrl, jobId, clipIndex, existingHook, bulkCount = 0, bulkProgress }) {
+export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll, onRemove, isProcessing, videoUrl, jobId, clipIndex, existingHook, bulkCount = 0, bulkProgress, submitLabel = null, onTop = false, captionsOverride = null }) {
     // Opens on the look the clip already has (the Default preset), so
     // "apply" without touching anything changes nothing.
     const [position, setPosition] = useState('bottom');
@@ -177,7 +177,18 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
 
     // Fetch word-level captions when modal opens
     useEffect(() => {
-        if (!isOpen || !jobId || clipIndex === undefined) return;
+        if (!isOpen) return;
+        // The clip editor hands over the words of the cut being edited, which
+        // the server's /transcript (the rendered cut) does not know yet.
+        if (captionsOverride) {
+            setCaptions(captionsOverride.captions);
+            setOriginalCaptions(captionsOverride.captions);
+            setEditableText(captionsOverride.captions.map(c => c.text).join(' '));
+            setDurationSec(captionsOverride.durationSec || 30);
+            setUseRemotionPreview(captionsOverride.captions.length > 0);
+            return;
+        }
+        if (!jobId || clipIndex === undefined) return;
 
         setCaptionsLoading(true);
         apiFetch(`/api/clip/${jobId}/${clipIndex}/transcript`)
@@ -195,6 +206,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
             })
             .catch(() => setUseRemotionPreview(false))
             .finally(() => setCaptionsLoading(false));
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [isOpen, jobId, clipIndex]);
 
     // When user edits text, keep each word on the original speech timing
@@ -266,7 +278,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
     };
 
     return (
-        <Modal isOpen={isOpen} onClose={onClose} size="xl" eyebrow="EDITOR · SUBTITLES" title="subtitles">
+        <Modal isOpen={isOpen} onClose={onClose} size="xl" eyebrow="EDITOR · SUBTITLES" title="subtitles" onTop={onTop}>
             <div className="flex flex-col md:flex-row gap-6">
                 {/* Left: Preview */}
                 <div className="flex-1 flex flex-col items-center justify-center bg-black rounded-card border border-rule overflow-hidden relative aspect-[9/16] max-h-[600px]">
@@ -566,7 +578,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
                                             className="btn-primary flex-1"
                                         >
                                             {(isProcessing && !bulkRunning) && <Loader2 size={16} className="animate-spin text-brassink" />}
-                                            {(isProcessing && !bulkRunning) ? 'generating...' : 'apply to this clip'}
+                                            {(isProcessing && !bulkRunning) ? 'generating...' : (submitLabel || 'apply to this clip')}
                                         </button>
                                     </div>
                                     {onApplyAll && bulkCount > 1 && (
