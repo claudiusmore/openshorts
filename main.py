@@ -34,6 +34,7 @@ from clip_selection import (build_transcript_windows, clip_count_targets,
                             clip_duration_bounds, dedupe_overlapping,
                             score_batches, shortlist_target,
                             snap_clip_to_words, trim_to_best,
+                            include_quoted_hook,
                             vision_segments)
 from ffmpeg_utils import (video_encode_args, audio_encode_args, cut_clip, QUALITY,
                           QUALITY_FAST, METADATA_SCRUB)
@@ -2215,6 +2216,14 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
             s["proposed"] = [s.get("start", 0), s.get("end", 0)]
             ns, ne = snap_clip_to_words(s.get("start", 0), s.get("end", 0), words, video_duration,
                                         min_duration=min_secs, max_duration=max_secs)
+            for quoted in (s.get("viral_hook_text"), s.get("video_title_for_youtube_short")):
+                qs, qe = include_quoted_hook(ns, ne, quoted, words, video_duration,
+                                             min_duration=min_secs, max_duration=max_secs)
+                if qs < ns:
+                    print(f"   ↩️ Clip start {ns:.1f}s -> {qs:.1f}s to include the "
+                          f"line its hook quotes")
+                    ns, ne = qs, qe
+                    break
             s["start"], s["end"] = ns, ne
         deduped = dedupe_overlapping(shorts)
         if len(deduped) < len(shorts):

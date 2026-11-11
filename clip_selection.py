@@ -5,6 +5,8 @@ Standard-library only so both main.py and gemini_worker.py can import it and
 the logic stays unit-testable without the heavy video dependencies.
 """
 import math
+import re
+import unicodedata
 
 # USD per 1M tokens (input, output incl. thinking), from ai.google.dev pricing.
 MODEL_PRICES = {
@@ -458,3 +460,81 @@ def snap_clip_to_words(start, end, words, video_duration,
     if new_end <= new_start or new_end - new_start < min_duration:
         return original
     return (round(new_start, 3), round(new_end, 3))
+
+
+# Function words of the languages the channel mostly sees; with the <4-letter
+# filter they keep a hook's match about its content words.
+_HOOK_STOPWORDS = {
+    "para", "como", "isso", "essa", "esse", "esta", "este", "isto", "mais",
+    "mas", "pelo", "pela", "quando", "porque", "voce", "voces", "sobre",
+    "entre", "muito", "muita", "tudo", "nada", "seus", "suas", "minha", "meus",
+    "that", "this", "with", "from", "your", "what", "they", "have", "will",
+    "about", "when", "just", "into", "than", "then", "there", "their",
+    "pero", "esto", "esta", "todo", "porque", "cuando",
+}
+
+
+def _hook_stems(text):
+    """Content-word stems (first 4 letters, accents folded) of a text."""
+    folded = unicodedata.normalize("NFKD", str(text or "").lower())
+    folded = "".join(ch for ch in folded if not unicodedata.combining(ch))
+    return [t[:4] for t in re.findall(r"[a-z0-9]+", folded)
+            if len(t) >= 4 and t not in _HOOK_STOPWORDS]
+
+
+def _best_hook_match(hook, words):
+    """(coverage, index of the first matching word) of the stretch of
+    ``words`` that holds most of ``hook``'s content words."""
+    stems = [(_hook_stems(w.get("w", "")) or [None])[0] for w in words]
+    # Spoken lines carry function words the hook drops ("eu falo que a ...").
+    span = max(8, 3 * len(hook))
+    best = (0.0, None)
+    for i in range(len(words)):
+        found = {s for s in stems[i:i + span] if s in hook}
+        cov = len(found) / len(hook)
+        if cov > best[0]:
+            first = next(j for j in range(i, min(i + span, len(words))) if stems[j] in hook)
+            best = (cov, first)
+    return best
+
+
+def include_quoted_hook(start, end, hook_text, words, video_duration,
+                        min_duration=15.0, max_duration=60.0,
+                        lookback=30.0, threshold=0.7, sentence_window=3.0):
+    """Move a clip's start back to a line its hook/title quotes but the cut
+    leaves out.
+
+    The model writes the hook from its candidate window, and the line it
+    quotes can sit a few seconds before the start it picked: a short titled
+    "A ansiedade de conquistar vira ansiedade de não perder" started 6 s after
+    that sentence was said. Returns (start, end), unchanged when the hook is
+    not quoted just before the cut, is already inside it, or including it
+    would push the clip past ``max_duration``.
+    """
+    hook = set(_hook_stems(hook_text))
+    if len(hook) < 3 or not words:
+        return start, end
+    before = [w for w in words if start - lookback <= float(w.get("s", 0)) < start]
+    inside = [w for w in words if start <= float(w.get("s", 0)) < end]
+    cov_before, first = _best_hook_match(hook, before)
+    cov_inside, _ = _best_hook_match(hook, inside)
+    if first is None or cov_before < threshold or cov_before <= cov_inside:
+        return start, end
+    # Open on the phrase that holds the quote: walk back (never forward, which
+    # would cut the quote again) up to sentence_window to a sentence end or a
+    # pause, else open on the quoted word itself.
+    i = words.index(before[first])
+    target = float(words[i].get("s", start))
+    j = i
+    while j > 0 and target - float(words[j - 1].get("s", 0)) <= sentence_window:
+        if _boundary_after(words, j - 1):
+            break
+        j -= 1
+    if not _boundary_after(words, j - 1):
+        j = i
+    word_start = float(words[j].get("s", start))
+    prev_end = float(words[j - 1].get("e", 0)) if j > 0 else 0.0
+    new_start = round(max(0.0, word_start - min(0.35, max(0.0, word_start - prev_end) / 2)), 3)
+    if end - new_start > max_duration:
+        return start, end
+    return new_start, end

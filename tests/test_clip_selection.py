@@ -406,3 +406,45 @@ def test_vision_segments_are_capped():
     segs = vision_segments(8 * 3600, 2400, 8)  # 12 stretches wanted
     assert len(segs) == 8
     assert segs[-1][1] < 8 * 3600
+
+
+# --- include_quoted_hook -------------------------------------------------------
+
+def _words_of(text, t0, step=0.3, pauses=()):
+    out, t = [], t0
+    for i, w in enumerate(text.split()):
+        if i in pauses:
+            t += 1.0
+        out.append({"w": " " + w, "s": round(t, 3), "e": round(t + step - 0.05, 3)})
+        t += step
+    return out
+
+
+def test_quoted_hook_before_the_start_pulls_the_start_back():
+    from clip_selection import include_quoted_hook
+    words = (_words_of("antes disso eu falo que a ansiedade de conquistar virou "
+                       "uma ansiedade de não perder e o tédio de possuir", 100.0, pauses=(2,))
+             + _words_of("a vida é uma busca entre conquistar e possuir " * 6, 106.0))
+    start, end = 106.0, 130.0
+    ns, ne = include_quoted_hook(start, end, "A ansiedade de conquistar vira ansiedade de não perder",
+                                 words, 200.0)
+    quoted = next(w for w in words if w["w"] == " ansiedade")
+    assert ns <= quoted["s"] and ns >= 100.0
+    assert ne == end
+
+
+def test_hook_already_inside_or_unrelated_keeps_the_clip():
+    from clip_selection import include_quoted_hook
+    words = _words_of("ansiedade de conquistar virou ansiedade de não perder " * 8, 100.0)
+    assert include_quoted_hook(110.0, 130.0, "ansiedade de conquistar vira ansiedade de não perder",
+                               words, 200.0) == (110.0, 130.0)
+    assert include_quoted_hook(110.0, 130.0, "Receita de bolo de cenoura fofinho",
+                               words, 200.0) == (110.0, 130.0)
+
+
+def test_quoted_hook_is_not_included_past_the_max_duration():
+    from clip_selection import include_quoted_hook
+    words = (_words_of("ela disse que nunca devolveria o dinheiro emprestado", 100.0)
+             + _words_of("depois tudo mudou " * 30, 115.0))
+    assert include_quoted_hook(115.0, 160.0, "Ela nunca devolveria o dinheiro emprestado",
+                               words, 200.0, max_duration=50.0) == (115.0, 160.0)

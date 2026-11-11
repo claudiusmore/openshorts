@@ -339,6 +339,9 @@ HOOK PLAYBOOK — pick the strongest fitting pattern for `viral_hook_text` (max 
   the number, the claim, the name. A line that could sit on any clip of this
   video ("I automated my clips with AI") is wrong. If nothing concrete can be
   named, quote the clip's strongest sentence instead of summarising the topic.
+- INSIDE THE CUT: a sentence the hook or title quotes or paraphrases must be
+  spoken between `start` and `end`. If the line you want is said before your
+  start, move the start back to include it (or pick another line).
 
 COPY RULES — ALL text fields (descriptions, title, hook) MUST be written in TRANSCRIPT_LANGUAGE ({language}):
 - Descriptions (TikTok + Instagram): 1-2 punchy sentences that tease the payoff
