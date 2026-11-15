@@ -64,6 +64,11 @@ export default function MediaInput({ onProcess, isProcessing }) {
     // Layout: 'auto' lets the AI pick per video (server default); the others
     // force one on so a podcast host who knows what they uploaded doesn't
     // depend on the detector, and 'none' keeps the plain single crop.
+    // Review before rendering: the AI picks the clips, the user previews and
+    // edits them, and only the approved ones are rendered.
+    const [reviewFirst, setReviewFirst] = useState(() => {
+        try { return localStorage.getItem('os_review_first') !== '0'; } catch { return true; }
+    });
     const [layout, setLayout] = useState(() => {
         try { return localStorage.getItem('os_layout') || 'auto'; } catch { return 'auto'; }
     });
@@ -134,11 +139,13 @@ export default function MediaInput({ onProcess, isProcessing }) {
             sourceEnd: range ? Math.round(range.end) : null,
             musicFile,
             musicVolume: musicFile ? musicVolume : null,
+            reviewFirst,
         };
         try {
             localStorage.setItem('os_auto_hook', autoHook ? '1' : '0');
             localStorage.setItem('os_auto_hook_style_v2', autoHookStyle);
             localStorage.setItem('os_layout', layout);
+            localStorage.setItem('os_review_first', reviewFirst ? '1' : '0');
         } catch { /* ignore */ }
         if (mode === 'url' && url) {
             onProcess({ type: 'url', payload: url, acknowledged: true, outputFormat, ...advanced });
@@ -459,7 +466,17 @@ export default function MediaInput({ onProcess, isProcessing }) {
                     )}
                 </div>
 
-                <label className="flex items-start gap-2.5 mt-5 text-left text-[13px] sm:text-xs leading-relaxed text-muted cursor-pointer select-none">
+                <label className="flex items-start gap-2.5 mt-5 text-left text-[13px] sm:text-xs leading-relaxed text-ink2 cursor-pointer select-none">
+                    <input
+                        type="checkbox"
+                        checked={reviewFirst}
+                        onChange={(e) => setReviewFirst(e.target.checked)}
+                        className="mt-0.5 w-4 h-4 shrink-0 accent-[var(--color-accent)] cursor-pointer"
+                    />
+                    <span>Review the clips before rendering (preview cut, hook, captions, title and description, then approve)</span>
+                </label>
+
+                <label className="flex items-start gap-2.5 mt-3 text-left text-[13px] sm:text-xs leading-relaxed text-muted cursor-pointer select-none">
                     <input
                         type="checkbox"
                         checked={acknowledged}

@@ -22,6 +22,7 @@ export function describeJobSettings(data, { groq = false, model = 'Gemini' } = {
         ['clips', data.targetClips ? `aim for ${data.targetClips}` : 'AI decides'],
         ['length', `${min}–${max}s${custom ? '' : ' (default)'}`],
         ['hook', data.autoHook ? `on · ${data.autoHookStyle || 'pill'}` : 'off'],
+        ['review', data.reviewFirst ? 'before rendering' : 'off'],
         ['music', data.musicFile ? `${data.musicFile.name} · ${data.musicVolume ?? 15}%` : 'none'],
         ['transcription', groq ? 'Groq · whisper-large-v3-turbo' : 'local whisper'],
         ['clip picking', model],

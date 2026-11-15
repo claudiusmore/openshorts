@@ -3,6 +3,7 @@ import cv2
 import subprocess
 import shutil
 import argparse
+import glob
 import re
 import sys
 import threading
@@ -2496,6 +2497,12 @@ if __name__ == '__main__':
                         help="Output aspect: vertical/auto (9:16), horizontal (keep 16:9), square (1:1).")
     parser.add_argument('--transcript', type=str,
                         help="Path to a precomputed transcript JSON (transcribe_media shape); skips transcription.")
+    review_mode = parser.add_mutually_exclusive_group()
+    review_mode.add_argument('--plan-only', action='store_true',
+                             help="Stop after the AI picked the clips (metadata.json written), render nothing.")
+    review_mode.add_argument('--render-plan', action='store_true',
+                             help="Render the clips in the output dir's metadata.json (a reviewed plan) "
+                                  "without transcribing or asking the AI again.")
 
     args = parser.parse_args()
     output_format = args.format
@@ -2635,7 +2642,7 @@ if __name__ == '__main__':
     # instead of one per clip, and the answer is a property of the material
     # ("this is a screencast"), which does not change between its own clips.
     # It runs before any render so the modules are switched on in time.
-    if layout_picker.ENABLED:
+    if layout_picker.ENABLED and not args.plan_only:
         try:
             _cap = cv2.VideoCapture(input_video)
             _fps = _cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -2658,7 +2665,7 @@ if __name__ == '__main__':
     # our captions are the only text layer (burned_subtitles.py). Only when we
     # caption at all, and never on a vertical source, which is passed through.
     source_subtitle_band = None
-    if (not args.skip_analysis
+    if (not args.skip_analysis and not args.plan_only
             and os.environ.get("AUTO_CAPTIONS", "1").strip() != "0"):
         try:
             import burned_subtitles
@@ -2695,6 +2702,19 @@ if __name__ == '__main__':
         # to Gemini vision (picks clips from the imagery instead of the speech).
         from transcribe_backends import NoAudioError
         transcript = None
+        # A reviewed plan already holds the clips (as edited by the user) and
+        # the transcript: render exactly that, no transcription, no AI pick.
+        reviewed_plan = None
+        if args.render_plan:
+            plan_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
+            if not plan_files:
+                raise RuntimeError("No reviewed plan (metadata.json) in the output directory.")
+            with open(plan_files[0], 'r', encoding='utf-8') as f:
+                reviewed_plan = json.load(f)
+            video_title = os.path.basename(plan_files[0])[:-len("_metadata.json")]
+            if (reviewed_plan.get('transcript') or {}).get('segments'):
+                transcript = reviewed_plan['transcript']
+            print(f"📝 Rendering the reviewed plan ({len(reviewed_plan.get('shorts') or [])} clips).")
         # Module handover (issue #68): another module already transcribed this
         # exact source with the same backend, so reuse its output. Any problem
         # with the file falls back to transcribing normally rather than failing.
@@ -2721,12 +2741,12 @@ if __name__ == '__main__':
                     print(f"♻️ Using the transcript made while the video downloaded "
                           f"({len(transcript['segments'])} segments).")
                     save_transcript_checkpoint(output_dir, transcript, input_video, duration)
-        if transcript is None:
+        if transcript is None and reviewed_plan is None:
             transcript = load_transcript_checkpoint(output_dir, input_video, duration)
             if transcript is not None:
                 print(f"♻️ Reusing the transcript from the interrupted run "
                       f"({len(transcript['segments'])} segments) — skipping transcription.")
-        if transcript is None:
+        if transcript is None and reviewed_plan is None:
             try:
                 transcript = transcribe_video(input_video)
                 save_transcript_checkpoint(output_dir, transcript, input_video, duration)
@@ -2735,7 +2755,8 @@ if __name__ == '__main__':
 
         # Music-only or wordless footage transcribes to a handful of words.
         # Clip it by what is on screen instead, like a video with no audio.
-        if transcript is not None and speech_is_sparse(transcript, duration):
+        if (reviewed_plan is None and transcript is not None
+                and speech_is_sparse(transcript, duration)):
             n_words = sum(len((sg.get("text") or "").split()) for sg in transcript["segments"])
             print(f"🔇 Only {n_words} word(s) of speech in {duration:.0f}s — "
                   f"switching to visual analysis.")
@@ -2743,7 +2764,9 @@ if __name__ == '__main__':
 
         # 4. Gemini Analysis (transcript-driven, or vision for silent videos)
         early_clips = (early_state or {}).get("clips") if early_state else None
-        if (transcript is not None and early_clips
+        if reviewed_plan is not None:
+            clips_data = reviewed_plan
+        elif (transcript is not None and early_clips
                 and transcript is early_state["transcript"]):
             print("♻️ Using the clips Gemini picked while the video downloaded.")
             clips_data = early_clips
@@ -2775,6 +2798,12 @@ if __name__ == '__main__':
             metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
             write_json_atomic(metadata_file, clips_data, indent=2)
             print(f"   Saved metadata to {metadata_file}")
+
+            if args.plan_only:
+                # The API shows this plan for review and starts the render
+                # (--render-plan) only once the user approves it.
+                print("PLAN_READY")
+                sys.exit(0)
 
             # 5. Process clips in parallel: each worker cuts + renders one
             # clip. Renders are mostly ffmpeg subprocesses (parallelize well);
@@ -2821,7 +2850,9 @@ if __name__ == '__main__':
                     # The hook was written from the transcript alone. When the
                     # render put this clip's meaning on the screen, rewrite hook
                     # and title from three of its frames BEFORE burning them.
-                    if success and hook_grounding.wanted(clip['layout_ranges'], end - start):
+                    # A reviewed plan keeps the hook and title the user approved.
+                    if (success and not args.render_plan
+                            and hook_grounding.wanted(clip['layout_ranges'], end - start)):
                         hook_grounding.reground(clip_final_path, clip, transcript, start, end)
                     captioned = None
                     split_ranges = _layouts.split_ranges(clip['layout_ranges'])

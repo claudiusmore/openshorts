@@ -47,6 +47,10 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 # Default to 1 if not set, but user can set higher for powerful servers
 MAX_CONCURRENT_JOBS = int(os.environ.get("MAX_CONCURRENT_JOBS", "5"))
 MAX_FILE_SIZE_MB = int(os.environ.get("MAX_FILE_SIZE_MB", "2048"))  # 2GB default
+# Jobs that render clips at once (everything but a --plan-only analysis). One
+# by default: a second video starts rendering only when the first one is done,
+# while analyses for review keep running alongside.
+RENDER_CONCURRENCY = max(1, int(os.environ.get("RENDER_CONCURRENCY", "1")))
 
 # How TikTok receives our uploads. MEDIA_UPLOAD lands the video in the user's
 # TikTok drafts so they finish the post inside TikTok's own editor; DIRECT_POST
@@ -836,6 +840,7 @@ thumbnail_sessions: Dict[str, Dict] = {}
 publish_jobs: Dict[str, Dict] = {}  # {publish_id: {status, result, error}}
 # Semester to limit concurrency to MAX_CONCURRENT_JOBS
 concurrency_semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
+render_semaphore = asyncio.Semaphore(RENDER_CONCURRENCY)
 
 
 # Queue position + ETA for /api/status. ``_admitting`` holds jobs already taken
@@ -1410,6 +1415,16 @@ def _recover_jobs_from_disk():
                 with open(owner_path) as f:
                     raw = f.read().strip()
                 owner = int(raw) if raw.isdigit() else (raw or None)
+            if os.path.exists(os.path.join(job_path, _REVIEW_MARKER)):
+                jobs[job_id] = {
+                    'status': 'review',
+                    'logs': _TimedLog(["📝 Clips picked — review them before rendering."]),
+                    'output_dir': job_path,
+                    'user_id': owner,
+                    'result': None,
+                }
+                recovered += 1
+                continue
             jobs[job_id] = {
                 'status': 'completed',
                 'logs': _TimedLog(["♻️ Job recovered from disk after server restart."]),
@@ -2212,6 +2227,15 @@ async def run_job_wrapper(job_id):
             print(f"♻️ Server stopping: leaving {job_id} for the next instance.")
             if interrupted:
                 raise asyncio.CancelledError()
+            return
+        if job and job.get('status') == 'review':
+            # Waiting for the user's approval: nothing to settle or announce
+            # yet, the render run that follows does all of that.
+            _clear_resume_manifest(job_id)
+            _running_jobs.discard(job_id)
+            concurrency_semaphore.release()
+            job_queue.task_done()
+            print(f"📝 Job {job_id} waiting for review.")
             return
         if _should_auto_retry(job):
             _schedule_auto_retry(job_id, job)
@@ -3110,6 +3134,10 @@ def enqueue_output(out, job_id):
                     except ValueError:
                         pass
                     continue
+                if decoded_line == "PLAN_READY":
+                    if job_id in jobs:
+                        jobs[job_id]['plan_ready'] = True
+                    continue
                 if decoded_line.startswith("JOB_CPU "):
                     # Internal marker: the job's CPU time (main.py, at exit).
                     print(f"📊 [job-cpu] {job_id} {decoded_line[8:]}")
@@ -3229,7 +3257,19 @@ async def run_job(job_id, job_data):
         # The daily paid-proxy budget ran out while this job was queued.
         env.pop("PROXY_URL", None)
     output_dir = job_data['output_dir']
-    
+
+    if "--plan-only" in cmd:
+        await _run_job_process(job_id, cmd, env, output_dir)
+        return
+    if render_semaphore.locked():
+        jobs[job_id]['logs'].append("⏳ Waiting for the render in progress to finish…")
+    async with render_semaphore:
+        if jobs[job_id].get('cancelled'):
+            return  # cancelled while waiting: /api/cancel already closed it
+        await _run_job_process(job_id, cmd, env, output_dir)
+
+
+async def _run_job_process(job_id, cmd, env, output_dir):
     jobs[job_id]['status'] = 'processing'
     jobs[job_id]['logs'].append("Job started by worker.")
     print(f"🎬 [run_job] Executing command for {job_id}: {' '.join(cmd)}")
@@ -3316,6 +3356,11 @@ async def run_job(job_id, job_data):
 
         if jobs[job_id].get('cancelled'):
             _finish_cancelled(job_id)
+        elif returncode == 0 and jobs[job_id].get('plan_ready'):
+            jobs[job_id]['status'] = 'review'
+            jobs[job_id]['result'] = None
+            jobs[job_id]['logs'].append("📝 Clips picked — review them before rendering.")
+            open(os.path.join(output_dir, _REVIEW_MARKER), "w").close()
         elif returncode == 0:
             jobs[job_id]['status'] = 'completed'
             jobs[job_id]['logs'].append("Process finished successfully.")
@@ -3820,6 +3865,7 @@ async def process_endpoint(
     source_end: Optional[str] = Form(None),
     music: Optional[UploadFile] = File(None),
     music_volume: Optional[str] = Form(None),
+    review_first: Optional[str] = Form(None),
 ):
     api_key = await resolve_gemini(request)
     if not api_key and not (llm_backend.active() and not BILLING_ENABLED):
@@ -3854,6 +3900,7 @@ async def process_endpoint(
         max_minutes = body.get("max_minutes")
         source_start = body.get("source_start")
         source_end = body.get("source_end")
+        review_first = body.get("review_first")
 
     # Normalize output format (auto = keep pipeline default).
     if output_format not in ("vertical", "horizontal", "square"):
@@ -4104,6 +4151,11 @@ async def process_endpoint(
     cmd.extend(["-o", job_output_dir])
     if output_format and output_format != "auto":
         cmd.extend(["--format", output_format])
+    review = str(review_first).lower() in ("1", "true", "yes")
+    if review:
+        # Stop after the AI picked the clips; the user reviews and approves
+        # them in the dashboard before anything is rendered (/api/plan).
+        cmd.append("--plan-only")
 
     print(f"[attestation] job={job_id} ip={attestation['ip']} source={attestation['source']} ack=true")
 
@@ -4212,6 +4264,9 @@ async def process_endpoint(
                            source_cap_minutes=source_cap, skip_statics=skip_statics,
                            via_api_key=jobs[job_id]['via_api_key'])
 
+    if review:
+        _save_review_settings(job_output_dir, env, chosen, output_format, priority)
+
     _enqueue_job(job_id, priority)
 
     return {"job_id": job_id, "status": "queued", "partial": partial,
@@ -4295,6 +4350,149 @@ async def get_status(job_id: str, request: Request):
         # offer), so the dashboard can say so next to the clips.
         "partial": job.get('partial'),
     }
+
+
+# --- Review before render ------------------------------------------------------
+# A job created with review_first runs main.py --plan-only: it stops once the
+# AI picked the clips. The dashboard previews that plan over the source video
+# (cut, hook, captions, title, description), the user edits it, and only the
+# approved clips are rendered by a second run (--render-plan).
+_REVIEW_MARKER = ".awaiting_review"
+_REVIEW_SETTINGS = "review_settings.json"
+# Render-time choices of the job, never credentials: the API key comes from the
+# approve request, everything else from the server env.
+_REVIEW_ENV_KEYS = ("AUTO_HOOK", "AUTO_HOOK_STYLE", "AUTO_CAPTIONS", "BG_MUSIC_PATH",
+                    "BG_MUSIC_VOLUME", "WATERMARK", "AUTO_LAYOUT")
+_PLAN_TEXT_FIELDS = ("viral_hook_text", "video_title_for_youtube_short",
+                     "video_description_for_tiktok", "video_description_for_instagram")
+
+
+def _save_review_settings(job_dir, env, layout_vars, output_format, priority):
+    keep = {k: env[k] for k in (*_REVIEW_ENV_KEYS, *layout_vars) if k in env}
+    write_json_atomic(os.path.join(job_dir, _REVIEW_SETTINGS),
+                      {"env": keep, "output_format": output_format, "priority": priority})
+
+
+def _read_review_settings(job_dir):
+    try:
+        with open(os.path.join(job_dir, _REVIEW_SETTINGS), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+async def _review_job(job_id, request):
+    job = jobs.get(job_id) or _job_view_from_disk(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    await _assert_job_owner(request, job)
+    if job.get('status') != 'review':
+        raise HTTPException(status_code=409, detail="This job is not waiting for review")
+    job_dir = os.path.join(OUTPUT_DIR, job_id)
+    metas = glob.glob(os.path.join(job_dir, "*_metadata.json"))
+    if not metas:
+        raise HTTPException(status_code=404, detail="Plan not found")
+    with open(metas[0], encoding="utf-8") as f:
+        return job, job_dir, metas[0], json.load(f)
+
+
+@app.get("/api/plan/{job_id}")
+async def get_plan(job_id: str, request: Request):
+    """The clips the AI picked, with everything needed to preview them."""
+    _, job_dir, _, data = await _review_job(job_id, request)
+    settings = _read_review_settings(job_dir)
+    env = {**os.environ, **settings.get("env", {})}
+    words, segments = [], []
+    for seg in (data.get('transcript') or {}).get('segments') or []:
+        segments.append([round(float(seg.get('start', 0)), 2), round(float(seg.get('end', 0)), 2),
+                         (seg.get('text') or '').strip()])
+        for w in seg.get('words') or []:
+            words.append([round(float(w['start']), 2), round(float(w['end']), 2), w['word'].strip()])
+    try:
+        hook_seconds = float(os.environ.get("AUTO_HOOK_SECONDS", "5"))
+    except ValueError:
+        hook_seconds = 5.0
+    return {
+        "clips": [{"index": i, "start": c.get('start'), "end": c.get('end'),
+                   **{k: c.get(k) or "" for k in _PLAN_TEXT_FIELDS}}
+                  for i, c in enumerate(data.get('shorts') or [])],
+        "words": words,
+        "segments": segments,
+        "source_url": _signed_source_url(job_id),
+        "hook": {"enabled": env.get("AUTO_HOOK") == "1",
+                 "style": env.get("AUTO_HOOK_STYLE") or "pill", "seconds": hook_seconds},
+        "captions": str(env.get("AUTO_CAPTIONS", "1")).strip() != "0",
+        "output_format": settings.get("output_format") or "auto",
+    }
+
+
+class PlanClip(BaseModel):
+    index: int
+    start: float
+    end: float
+    viral_hook_text: Optional[str] = None
+    video_title_for_youtube_short: Optional[str] = None
+    video_description_for_tiktok: Optional[str] = None
+    video_description_for_instagram: Optional[str] = None
+
+
+class PlanRenderRequest(BaseModel):
+    clips: List[PlanClip]
+
+
+@app.post("/api/plan/{job_id}/render")
+async def render_plan(job_id: str, req: PlanRenderRequest, request: Request):
+    """Render the approved clips, with the user's edits, in the given order."""
+    job, job_dir, meta_path, data = await _review_job(job_id, request)
+    source = _locate_source(job_id)
+    if not source:
+        raise HTTPException(status_code=404, detail="Source video is no longer on disk")
+    shorts = data.get('shorts') or []
+    duration = _media_duration_seconds(source)
+    approved = []
+    for c in req.clips:
+        if not 0 <= c.index < len(shorts):
+            raise HTTPException(status_code=400, detail=f"Unknown clip {c.index}")
+        start, end = max(0.0, c.start), c.end
+        if duration > 0:
+            end = min(end, duration)
+        if end - start < 3:
+            raise HTTPException(status_code=400, detail=f"Clip {c.index + 1} must be at least 3 s long")
+        clip = dict(shorts[c.index])
+        clip['start'], clip['end'] = round(start, 2), round(end, 2)
+        for k in _PLAN_TEXT_FIELDS:
+            value = getattr(c, k)
+            if value is not None:
+                clip[k] = value.strip()
+        approved.append(clip)
+    if not approved:
+        raise HTTPException(status_code=400, detail="Pick at least one clip to render")
+    data['shorts'] = approved
+    write_json_atomic(meta_path, data, indent=2)
+
+    settings = _read_review_settings(job_dir)
+    env = child_env()
+    env.update(settings.get("env", {}))
+    api_key = await resolve_gemini(request)
+    if api_key:
+        env["GEMINI_API_KEY"] = api_key
+    else:
+        env.pop("GEMINI_API_KEY", None)
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    cmd = [sys.executable, "-u", "main.py", "-i", source, "-o", job_dir, "--render-plan"]
+    if settings.get("output_format") not in (None, "", "auto"):
+        cmd.extend(["--format", settings["output_format"]])
+
+    try:
+        os.remove(os.path.join(job_dir, _REVIEW_MARKER))
+    except OSError:
+        pass
+    job = jobs.setdefault(job_id, job)
+    job.update({'status': 'queued', 'cmd': cmd, 'env': env, 'output_dir': job_dir,
+                'plan_ready': False, 'result': None, 'ready_files': {}})
+    job['logs'].append(f"▶️ Rendering {len(approved)} approved clip(s).")
+    _enqueue_job(job_id, int(settings.get("priority") or 2))
+    return {"job_id": job_id, "status": "queued", "clips": len(approved)}
 
 
 def _locate_source(job_id: str):

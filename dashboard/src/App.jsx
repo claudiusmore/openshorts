@@ -5,6 +5,7 @@ import MediaInput from './components/MediaInput';
 import McpConnectCard from './components/McpConnectCard';
 import ResultCard from './components/ResultCard';
 import ProcessingAnimation from './components/ProcessingAnimation';
+import PlanReview from './components/PlanReview';
 // import Gallery from './components/Gallery';
 import ThumbnailStudio from './components/ThumbnailStudio';
 import SaaShortsTab from './components/SaaShortsTab';
@@ -641,7 +642,8 @@ function App() {
     setJobError('');
     setProcessingMedia({ type: 'server', payload: `/api/source/${projectJobId}` });
     const running = data.status === 'processing' || data.status === 'queued';
-    setStatus(running ? 'processing' : data.status === 'failed' ? 'error' : 'complete');
+    setStatus(running ? 'processing' : data.status === 'failed' ? 'error'
+      : data.status === 'review' ? 'review' : 'complete');
     if (data.status === 'failed') {
       setJobError(readableError(data.logs?.length ? data.logs[data.logs.length - 1] : 'Process failed'));
     }
@@ -874,7 +876,15 @@ function App() {
           if (data.partial) setPartialJob(data.partial);
           setQueueInfo(data.status === 'queued' && data.queue ? data.queue : null);
 
-          if (data.status === 'completed') {
+          if (data.status === 'review') {
+            setQueueInfo(null);
+            setStatus('review');
+            if (data.logs) {
+              setLogs(data.logs);
+              setLogTimes(data.log_times || []);
+            }
+            clearInterval(interval);
+          } else if (data.status === 'completed') {
             setQueueInfo(null);
             setStatus('complete');
             clearInterval(interval);
@@ -1220,6 +1230,8 @@ function App() {
         // The stretch picked under the cost line (seconds); absent = whole video.
         source_start: data.sourceStart ?? null,
         source_end: data.sourceEnd ?? null,
+        // Stop after the AI picks the clips; render only what the user approves.
+        review_first: data.reviewFirst ? '1' : null,
       };
 
       // A music file cannot ride JSON: a link with music goes multipart too.
@@ -2252,11 +2264,11 @@ function App() {
           )}
 
           {/* View: Processing / Results (Split View) */}
-          {activeTab === 'dashboard' && (status === 'processing' || status === 'complete' || status === 'error') && (
+          {activeTab === 'dashboard' && (status === 'processing' || status === 'complete' || status === 'error' || status === 'review') && (
             <div className="h-full flex flex-col md:flex-row gap-3 md:gap-4 p-3 md:p-4 overflow-y-auto md:overflow-y-hidden custom-scrollbar animate-fade">
 
               {/* Left Panel: Preview & Status */}
-              <div className={`${status === 'complete' ? 'w-full md:w-[30%] lg:w-[25%]' : 'w-full md:w-[55%] lg:w-[60%]'} md:h-full flex flex-col shrink-0 md:shrink card p-3.5 sm:p-6 md:overflow-y-auto custom-scrollbar transition-all duration-700 ease-in-out`}>
+              <div className={`${status === 'complete' || status === 'review' ? 'w-full md:w-[30%] lg:w-[25%]' : 'w-full md:w-[55%] lg:w-[60%]'} md:h-full flex flex-col shrink-0 md:shrink card p-3.5 sm:p-6 md:overflow-y-auto custom-scrollbar transition-all duration-700 ease-in-out`}>
                 <div className="mb-4 sm:mb-6 flex items-center justify-between gap-2">
                   <h2 className="text-sm font-medium text-ink lowercase flex items-center gap-2">
                     <Activity className={`text-brass ${status === 'processing' ? 'animate-pulse' : ''}`} size={18} />
@@ -2284,7 +2296,7 @@ function App() {
                         <Loader2 size={12} className="animate-spin" /> stopping…
                       </span>
                     )}
-                    <span className={status === 'processing' ? 'badge-brass' :
+                    <span className={status === 'processing' || status === 'review' ? 'badge-brass' :
                       status === 'complete' ? 'badge-ok' :
                         'badge-danger'
                       }>
@@ -2576,7 +2588,16 @@ function App() {
                 )}
 
                 <div className="flex-1 overflow-y-auto custom-scrollbar p-1">
-                  {results && results.clips && results.clips.length > 0 ? (
+                  {status === 'review' ? (
+                    <PlanReview
+                      jobId={jobId}
+                      geminiKey={apiKey}
+                      onRendered={() => {
+                        setResults(null);
+                        setStatus('processing');
+                      }}
+                    />
+                  ) : results && results.clips && results.clips.length > 0 ? (
                     <div className={`grid gap-4 pb-10 ${status === 'complete' ? 'grid-cols-[repeat(auto-fill,minmax(min(100%,600px),1fr))]' : 'grid-cols-1'}`}>
                       {rankedClips.map(({ clip, index: i }) => (
                         <ResultCard
