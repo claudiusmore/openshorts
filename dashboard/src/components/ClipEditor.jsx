@@ -6,6 +6,7 @@ import {
 } from 'lucide-react';
 import SubtitleModal from './SubtitleModal';
 import HookModal from './HookModal';
+import { PlanOverlay } from './PlanReview';
 import { getApiUrl, withParam } from '../config';
 import { apiFetch, apiJson, QuotaError, openQuotaWall } from '../lib/api';
 import { useAuth } from '../contexts/AuthContext';
@@ -270,7 +271,9 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
                 setRenderedCaptions(data.has_captions ?? true);
                 setMusicEnabled(data.music?.enabled ?? true);
                 setMusicVolume(data.music?.volume ?? 0.15);
-                setPreviewUrl(getApiUrl(`/videos/${jobId}/${data.current_file}`));
+                // A clip still in review has no file yet: the program monitor
+                // plays the source through the cut instead (plan mode).
+                setPreviewUrl(getApiUrl(data.plan ? data.source.url : `/videos/${jobId}/${data.current_file}`));
             } catch (e) {
                 if (!cancelled) setLoadError(e.detail || e.message || 'could not load the clip recipe');
             }
@@ -279,8 +282,16 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
     }, [jobId, clipIndex]);
 
     const words = useMemo(() => (edl?.words || []), [edl]);
+    const planMode = !!edl?.plan;
     const sourceAvailable = !!edl?.source?.available;
     const sourceDuration = edl?.source?.duration || 0;
+    // Source track zoom: the visible window of source seconds, or null for
+    // the whole source. A long source shrinks a short clip to a sliver.
+    const [srcView, setSrcView] = useState(null);
+    const viewStart = srcView ? srcView.start : 0;
+    const viewLen = srcView ? srcView.end - srcView.start : sourceDuration;
+    const pct = (t) => (viewLen > 0 ? ((t - viewStart) / viewLen) * 100 : 0);
+    const wpct = (d) => (viewLen > 0 ? (d / viewLen) * 100 : 0);
     const canonical = useMemo(() => edl?.canonical_range || { start: 0, end: 0 }, [edl]);
     const limits = edl?.limits || { max_segments: 12, min_segment_seconds: MIN_SEGMENT_SECONDS, max_total_seconds: 180 };
     const minSeg = limits.min_segment_seconds || MIN_SEGMENT_SECONDS;
@@ -519,6 +530,39 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
         d.mark(seg.start, seg.end);
     }, [onGhostMove]);
 
+    // Scroll zooms the source track around the pointer; shift+scroll (or a
+    // sideways swipe) pans. Native listener: React's onWheel is passive and
+    // cannot stop the page from scrolling instead.
+    useEffect(() => {
+        const el = sourceTrackRef.current;
+        if (!el || !sourceDuration) return undefined;
+        const onWheel = (e) => {
+            e.preventDefault();
+            const rect = el.getBoundingClientRect();
+            const frac = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+            const pan = e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY);
+            setSrcView((v) => {
+                const start = v ? v.start : 0;
+                const len = v ? v.end - v.start : sourceDuration;
+                let nStart = start;
+                let nLen = len;
+                if (pan) {
+                    const d = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+                    nStart = start + (d / rect.width) * len;
+                } else {
+                    nLen = Math.max(Math.min(sourceDuration, 5),
+                        Math.min(sourceDuration, len * Math.exp(e.deltaY * 0.0015)));
+                    nStart = start + frac * len - frac * nLen;
+                }
+                if (nLen >= sourceDuration - 1e-6) return null;
+                nStart = Math.max(0, Math.min(sourceDuration - nLen, nStart));
+                return { start: nStart, end: nStart + nLen };
+            });
+        };
+        el.addEventListener('wheel', onWheel, { passive: false });
+        return () => el.removeEventListener('wheel', onWheel);
+    }, [sourceDuration, sourceOpen, edl]);
+
     const startGhostDrag = (e) => {
         if (e.button !== undefined && e.button !== 0) return;
         if (!sourceAvailable || !sourceDuration) return;
@@ -527,14 +571,14 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
         // Same reason as startTrimDrag: without this Chrome selects the track's
         // labels and the follow-up gesture becomes a native text drag.
         e.preventDefault();
-        const t0 = ((e.clientX - rect.left) / rect.width) * sourceDuration;
+        const t0 = viewStart + ((e.clientX - rect.left) / rect.width) * viewLen;
         // Landing anywhere on the track parks the monitor there — that alone is
         // how you find a cut point, so it happens even when the segment cap is
         // reached and no new block can be painted.
         seekSource(t0);
         try { e.currentTarget.setPointerCapture?.(e.pointerId); } catch { /* window listeners still fire */ }
         dragRef.current = {
-            kind: 'ghost', startX: e.clientX, pxPerSec: rect.width / sourceDuration,
+            kind: 'ghost', startX: e.clientX, pxPerSec: rect.width / viewLen,
             t0, duration: sourceDuration, range: null, snap: snapEdge, minSeg,
             seek: seekSource,
             mark: (a, b) => { setMarkIn(a); setMarkOut(b); },
@@ -556,7 +600,10 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
         // A framing change invalidates the whole file even where the ranges
         // still line up: the crop baked into those frames is not what will
         // come out.
-        if (!renderedSegments || framing !== renderedFraming) {
+        // Plan mode: the "file" is the source itself, so every instant of the
+        // cut is covered at its own source time.
+        const base = planMode ? [{ start: 0, end: edl?.source?.duration || 1e9 }] : renderedSegments;
+        if (!base || (!planMode && framing !== renderedFraming)) {
             return [{ start: 0, end: totalOf(segments), rendered: null }];
         }
         const spans = [];
@@ -567,7 +614,7 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
             // into the file each overlap lands.
             const pieces = [];
             let renAcc = 0;
-            for (const r of renderedSegments) {
+            for (const r of base) {
                 const lo = Math.max(seg.start, r.start);
                 const hi = Math.min(seg.end, r.end);
                 if (hi - lo > COVERAGE_EPSILON) {
@@ -607,7 +654,7 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
             clipAcc += segLen;
         }
         return spans;
-    }, [segments, renderedSegments, framing, renderedFraming]);
+    }, [segments, renderedSegments, framing, renderedFraming, planMode, edl]);
 
     const missingSeconds = useMemo(() => coverage.reduce(
         (acc, sp) => (sp.rendered === null ? acc + (sp.end - sp.start) : acc), 0), [coverage]);
@@ -713,6 +760,11 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
         return last ? last.end : 0;
     }, [segments]);
 
+    // Plan mode overlay: the words inside the cut, as [start, end, text].
+    const planWords = useMemo(() => (planMode ? words
+        .filter((w) => segments.some((sg) => w.e > sg.start && w.s < sg.end))
+        .map((w) => [w.s, w.e, w.w]) : []), [planMode, words, segments]);
+
     // Which coverage span the rendered file is playing through.
     const playSpanRef = useRef(0);
 
@@ -722,7 +774,7 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
     // the frame left on screen is the endpoint itself, not the overshoot.
     const stepPlayback = useCallback((v) => {
         if (dragRef.current?.kind === 'scrub') return;   // seeks report a frame late
-        if (!dirty) { setPlayhead(v.currentTime); return; }
+        if (!dirty && !planMode) { setPlayhead(v.currentTime); return; }
 
         let i = playSpanRef.current;
         let sp = coverage[i];
@@ -749,7 +801,7 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
         playSpanRef.current = i;
         setPlayhead(next.start);
         try { v.currentTime = next.rendered; } catch { /* not seekable yet */ }
-    }, [coverage, dirty, segments]);
+    }, [coverage, dirty, planMode, segments]);
 
     const onClipTimeUpdate = useCallback((e) => stepPlayback(e.target), [stepPlayback]);
 
@@ -776,21 +828,21 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
 
     // The native controls scrub the FILE; bring that back onto the clip.
     const onClipSeeked = useCallback((e) => {
-        if (!dirty || dragRef.current?.kind === 'scrub') return;
+        if ((!dirty && !planMode) || dragRef.current?.kind === 'scrub') return;
         const t = renderedToClip(e.target.currentTime);
         if (t === null) return;   // landed on material this edit dropped
         setPlayhead(t);
         playSpanRef.current = spanIndexAt(t);
-    }, [dirty, renderedToClip, spanIndexAt]);
+    }, [dirty, planMode, renderedToClip, spanIndexAt]);
 
     // Refuse to roll from a span the file cannot show — same reason as above.
     const onClipPlay = useCallback((e) => {
-        if (dirty) {
+        if (dirty || planMode) {
             const sp = coverage[playSpanRef.current];
             if (sp && sp.rendered === null) { e.target.pause(); return; }
         }
         startPlayLoop();
-    }, [coverage, dirty, startPlayLoop]);
+    }, [coverage, dirty, planMode, startPlayLoop]);
 
     const onScrubMove = useCallback((e) => {
         const d = dragRef.current;
@@ -976,6 +1028,7 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
             setEdl((prev) => (prev ? {
                 ...prev,
                 current_file: data.new_video_url.split('/').pop(),
+                plan: false,
                 hook: data.hook || null,
                 caption_style: data.caption_style || null,
                 music: { ...prev.music, ...sentMusic },
@@ -1130,8 +1183,8 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
                     <div
                         className="absolute top-0 bottom-0 border-x border-rule2 bg-paper3/60 pointer-events-none"
                         style={{
-                            left: `${(canonical.start / sourceDuration) * 100}%`,
-                            width: `${((canonical.end - canonical.start) / sourceDuration) * 100}%`,
+                            left: `${pct(canonical.start)}%`,
+                            width: `${wpct(canonical.end - canonical.start)}%`,
                         }}
                     />
                 )}
@@ -1140,11 +1193,11 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
                         key={i}
                         // Body drag slides the segment along the source without
                         // changing its duration; the edges trim it.
-                        onPointerDown={(e) => startTrimDrag(e, i, 'move', sourceTrackRef.current, sourceDuration)}
+                        onPointerDown={(e) => startTrimDrag(e, i, 'move', sourceTrackRef.current, viewLen)}
                         className={`absolute top-1 bottom-1 rounded-[4px] touch-none cursor-grab active:cursor-grabbing ${i === selected ? 'ring-1 ring-[color:var(--color-accent)]' : ''}`}
                         style={{
-                            left: `${(seg.start / sourceDuration) * 100}%`,
-                            width: `${Math.max(((seg.end - seg.start) / sourceDuration) * 100, 0.4)}%`,
+                            left: `${pct(seg.start)}%`,
+                            width: `${Math.max(wpct(seg.end - seg.start), 0.4)}%`,
                             // A short segment on a 14-minute source is a sliver;
                             // without a floor there is nothing left to grab.
                             minWidth: '14px',
@@ -1155,11 +1208,11 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
                         {/* Capped at a third each so the middle stays grabbable
                             however narrow the block gets. */}
                         <div
-                            onPointerDown={(e) => startTrimDrag(e, i, 'start', sourceTrackRef.current, sourceDuration)}
+                            onPointerDown={(e) => startTrimDrag(e, i, 'start', sourceTrackRef.current, viewLen)}
                             className="absolute left-0 top-0 bottom-0 w-1.5 max-w-[33%] touch-none cursor-ew-resize rounded-l-[4px] bg-ink/35"
                         />
                         <div
-                            onPointerDown={(e) => startTrimDrag(e, i, 'end', sourceTrackRef.current, sourceDuration)}
+                            onPointerDown={(e) => startTrimDrag(e, i, 'end', sourceTrackRef.current, viewLen)}
                             className="absolute right-0 top-0 bottom-0 w-1.5 max-w-[33%] touch-none cursor-ew-resize rounded-r-[4px] bg-ink/35"
                         />
                     </div>
@@ -1168,8 +1221,8 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
                     <div
                         className="absolute inset-y-0 border-x-2 border-brass bg-brass/15 pointer-events-none"
                         style={{
-                            left: `${(markRange.start / sourceDuration) * 100}%`,
-                            width: `${((markRange.end - markRange.start) / sourceDuration) * 100}%`,
+                            left: `${pct(markRange.start)}%`,
+                            width: `${wpct(markRange.end - markRange.start)}%`,
                         }}
                     />
                 )}
@@ -1180,7 +1233,7 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
                         <div
                             key={i}
                             className="absolute inset-y-0 w-0.5 bg-brass pointer-events-none"
-                            style={{ left: `${(t / sourceDuration) * 100}%` }}
+                            style={{ left: `${pct(t)}%` }}
                         />
                     )
                 ))}
@@ -1188,23 +1241,32 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
                 {sourceOpen && sourceDuration > 0 && (
                     <div
                         className="absolute top-0 bottom-0 w-px bg-ink pointer-events-none"
-                        style={{ left: `${(Math.min(sourceTime, sourceDuration) / sourceDuration) * 100}%` }}
+                        style={{ left: `${pct(Math.min(sourceTime, sourceDuration))}%` }}
                     />
                 )}
                 {ghost && sourceDuration > 0 && (
                     <div
                         className="absolute top-1 bottom-1 rounded-[4px] bg-ink/40 border border-dashed border-ink pointer-events-none"
                         style={{
-                            left: `${(ghost.start / sourceDuration) * 100}%`,
-                            width: `${((ghost.end - ghost.start) / sourceDuration) * 100}%`,
+                            left: `${pct(ghost.start)}%`,
+                            width: `${wpct(ghost.end - ghost.start)}%`,
                         }}
                     />
                 )}
             </div>
-            <div className="flex justify-between mt-1">
-                <span className="readout">0:00</span>
-                <span className="readout">{fmt(sourceDuration / 2)}</span>
-                <span className="readout">{fmt(sourceDuration)}</span>
+            <div className="flex justify-between items-center mt-1 gap-2">
+                <span className="readout">{fmt(viewStart)}</span>
+                <span className="readout flex items-center gap-2">
+                    {srcView ? (
+                        <>
+                            {fmt(viewStart + viewLen / 2)} · ZOOM ×{(sourceDuration / viewLen).toFixed(1)}
+                            <button type="button" onClick={() => setSrcView(null)} className="underline hover:text-brass">SHOW ALL</button>
+                        </>
+                    ) : (
+                        <>{fmt(sourceDuration / 2)} · SCROLL TO ZOOM</>
+                    )}
+                </span>
+                <span className="readout">{fmt(viewStart + viewLen)}</span>
             </div>
         </div>
     );
@@ -1418,6 +1480,9 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
                 <div className={`flex flex-col min-h-0 gap-2 ${sourceOpen ? 'xl:w-[26rem] 2xl:w-[30rem] xl:shrink-0' : 'flex-1'}`}>
                     <div className="flex items-center justify-between gap-2 shrink-0">
                         <p className="eyebrow">Program</p>
+                        {planMode && !dirty && (
+                            <span className="badge-warn">not rendered yet · approximate preview</span>
+                        )}
                         {dirty && (
                             <span className="badge-warn">
                                 {missingSeconds > COVERAGE_EPSILON
@@ -1427,18 +1492,34 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
                         )}
                     </div>
                     <div className="flex-1 min-h-0 flex items-center justify-center">
-                        <div className="h-full max-h-full aspect-[9/16] bg-black rounded-card border border-rule overflow-hidden">
+                        <div className="relative h-full max-h-full aspect-[9/16] bg-black rounded-card border border-rule overflow-hidden">
                             <video
                                 ref={videoRef}
                                 src={previewUrl}
                                 controls
                                 playsInline
-                                className="w-full h-full object-contain"
+                                className={`w-full h-full ${planMode ? 'object-cover' : 'object-contain'}`}
+                                onLoadedMetadata={(e) => {
+                                    if (!planMode || !coverage[0]) return;
+                                    e.target.currentTime = coverage[0].rendered;
+                                    playSpanRef.current = 0;
+                                    setPlayhead(0);
+                                }}
                                 onTimeUpdate={onClipTimeUpdate}
                                 onSeeked={onClipSeeked}
                                 onPlay={onClipPlay}
                                 onPause={stopPlayLoop}
                             />
+                            {planMode && (
+                                <PlanOverlay
+                                    words={planWords}
+                                    time={clipToSource(playhead)}
+                                    hookText={currentHook?.text}
+                                    hookStyle={currentHook?.style}
+                                    showHook={playhead < (currentHook?.duration_seconds || 5)}
+                                    captions={reapplyCaptions}
+                                />
+                            )}
                         </div>
                     </div>
 
@@ -1764,10 +1845,10 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
                             >
                                 {rendering ? 'close' : dirty ? 'cancel' : 'close'}
                             </button>
-                            <button className="btn-primary flex-1 flex items-center justify-center gap-2" disabled={!canRender || !dirty} onClick={doRender}>
+                            <button className="btn-primary flex-1 flex items-center justify-center gap-2" disabled={!canRender || (!dirty && !planMode)} onClick={doRender}>
                                 {rendering
                                     ? (<><Loader2 size={16} className="animate-spin text-brassink" /> re-rendering… {renderSeconds}s</>)
-                                    : (needsSourcePath ? 're-render from source' : 'render short')}
+                                    : (planMode ? 'render short' : needsSourcePath ? 're-render from source' : 'render short')}
                             </button>
                         </div>
                         {rendering && (

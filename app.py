@@ -1423,6 +1423,7 @@ def _recover_jobs_from_disk():
                     'user_id': owner,
                     'result': None,
                 }
+                jobs[job_id]['result'] = _review_result(job_id)
                 recovered += 1
                 continue
             jobs[job_id] = {
@@ -3266,6 +3267,9 @@ async def run_job(job_id, job_data):
     async with render_semaphore:
         if jobs[job_id].get('cancelled'):
             return  # cancelled while waiting: /api/cancel already closed it
+        if "--render-plan" in cmd:
+            await _run_plan_render(job_id, jobs[job_id])
+            return
         await _run_job_process(job_id, cmd, env, output_dir)
 
 
@@ -3358,9 +3362,9 @@ async def _run_job_process(job_id, cmd, env, output_dir):
             _finish_cancelled(job_id)
         elif returncode == 0 and jobs[job_id].get('plan_ready'):
             jobs[job_id]['status'] = 'review'
-            jobs[job_id]['result'] = None
             jobs[job_id]['logs'].append("📝 Clips picked — review them before rendering.")
             open(os.path.join(output_dir, _REVIEW_MARKER), "w").close()
+            jobs[job_id]['result'] = _review_result(job_id)
         elif returncode == 0:
             jobs[job_id]['status'] = 'completed'
             jobs[job_id]['logs'].append("Process finished successfully.")
@@ -4414,6 +4418,10 @@ async def get_plan(job_id: str, request: Request):
         hook_seconds = 5.0
     return {
         "clips": [{"index": i, "start": c.get('start'), "end": c.get('end'),
+                   # The model's own pick and reasoning, before the code
+                   # snapped/trimmed the cut (clip_selection).
+                   "why": c.get('why') or "", "score": c.get('predicted_score'),
+                   "proposed": c.get('proposed'),
                    **{k: c.get(k) or "" for k in _PLAN_TEXT_FIELDS}}
                   for i, c in enumerate(data.get('shorts') or [])],
         "words": words,
@@ -4440,17 +4448,10 @@ class PlanRenderRequest(BaseModel):
     clips: List[PlanClip]
 
 
-@app.post("/api/plan/{job_id}/render")
-async def render_plan(job_id: str, req: PlanRenderRequest, request: Request):
-    """Render the approved clips, with the user's edits, in the given order."""
-    job, job_dir, meta_path, data = await _review_job(job_id, request)
-    source = _locate_source(job_id)
-    if not source:
-        raise HTTPException(status_code=404, detail="Source video is no longer on disk")
+def _apply_plan_edits(data, edits, duration):
+    """Write the user's edits of some planned clips into the metadata dict."""
     shorts = data.get('shorts') or []
-    duration = _media_duration_seconds(source)
-    approved = []
-    for c in req.clips:
+    for c in edits:
         if not 0 <= c.index < len(shorts):
             raise HTTPException(status_code=400, detail=f"Unknown clip {c.index}")
         start, end = max(0.0, c.start), c.end
@@ -4458,16 +4459,105 @@ async def render_plan(job_id: str, req: PlanRenderRequest, request: Request):
             end = min(end, duration)
         if end - start < 3:
             raise HTTPException(status_code=400, detail=f"Clip {c.index + 1} must be at least 3 s long")
-        clip = dict(shorts[c.index])
+        clip = shorts[c.index]
+        # The cut as the pipeline delivered it, before any user edit.
+        clip.setdefault('adjusted', [clip.get('start'), clip.get('end')])
         clip['start'], clip['end'] = round(start, 2), round(end, 2)
         for k in _PLAN_TEXT_FIELDS:
             value = getattr(c, k)
             if value is not None:
                 clip[k] = value.strip()
-        approved.append(clip)
-    if not approved:
+
+
+def _review_result(job_id):
+    """Every planned clip in metadata order (so indexes match the editor's),
+    each with its render_state; rendered ones carry their video_url."""
+    job = jobs.get(job_id) or {}
+    job_dir = os.path.join(OUTPUT_DIR, job_id)
+    metas = glob.glob(os.path.join(job_dir, "*_metadata.json"))
+    if not metas:
+        return None
+    with open(metas[0], encoding="utf-8") as f:
+        data = json.load(f)
+    base = os.path.basename(metas[0])[:-len("_metadata.json")]
+    ready = job.get('ready_files') or {}
+    clips = []
+    for i, c in enumerate(data.get('shorts') or []):
+        c = dict(c)
+        c.pop('video_url', None)
+        name = ready.get(i) or _canonical_clip_file(job_dir, base, i)
+        try:
+            rendered = os.path.getsize(os.path.join(job_dir, name)) > 0
+        except OSError:
+            rendered = False
+        if rendered:
+            c['video_url'] = f"/videos/{job_id}/{name}"
+            c['render_state'] = 'rendered'
+        elif i in job.get('render_running', ()):
+            c['render_state'] = 'rendering'
+        elif i in job.get('render_pending', ()):
+            c['render_state'] = 'queued'
+        elif i in job.get('render_failed', ()):
+            c['render_state'] = 'failed'
+        else:
+            c['render_state'] = 'plan'
+        clips.append(c)
+    return {'clips': clips, 'cost_analysis': data.get('cost_analysis'), 'review': True}
+
+
+def _plan_clip_unrendered(job_id, clip_index):
+    """A clip of a job in review that has no rendered file yet."""
+    if (jobs.get(job_id) or {}).get('status') != 'review':
+        return False
+    result = _review_result(job_id) or {}
+    clips = result.get('clips') or []
+    return 0 <= clip_index < len(clips) and clips[clip_index]['render_state'] != 'rendered'
+
+
+def _plan_hook(job_id, clip):
+    """The hook the pipeline would burn on a planned clip (auto_hook_clip)."""
+    env = {**os.environ, **_read_review_settings(os.path.join(OUTPUT_DIR, job_id)).get("env", {})}
+    text = (clip.get('viral_hook_text') or '').strip()
+    if env.get("AUTO_HOOK") != "1" or not text:
+        return None
+    try:
+        seconds = float(os.environ.get("AUTO_HOOK_SECONDS", "5"))
+    except ValueError:
+        seconds = 5.0
+    return {"text": text, "style": env.get("AUTO_HOOK_STYLE") or "pill",
+            "position": "auto", "duration_seconds": seconds}
+
+
+def _plan_captions_on(job_id):
+    env = {**os.environ, **_read_review_settings(os.path.join(OUTPUT_DIR, job_id)).get("env", {})}
+    return str(env.get("AUTO_CAPTIONS", "1")).strip() != "0"
+
+
+@app.post("/api/plan/{job_id}/clips")
+async def save_plan_clips(job_id: str, req: PlanRenderRequest, request: Request):
+    """Save edits of planned clips without rendering them."""
+    job, job_dir, meta_path, data = await _review_job(job_id, request)
+    source = _locate_source(job_id)
+    _apply_plan_edits(data, req.clips, _media_duration_seconds(source) if source else 0)
+    write_json_atomic(meta_path, data, indent=2)
+    job = jobs.setdefault(job_id, job)
+    job['result'] = _review_result(job_id)
+    return job['result']
+
+
+@app.post("/api/plan/{job_id}/render")
+async def render_plan(job_id: str, req: PlanRenderRequest, request: Request):
+    """Queue the given planned clips for rendering, with the user's edits.
+
+    The job stays in review: clips render one run at a time (render_semaphore)
+    while the rest of the plan can still be edited and queued."""
+    job, job_dir, meta_path, data = await _review_job(job_id, request)
+    source = _locate_source(job_id)
+    if not source:
+        raise HTTPException(status_code=404, detail="Source video is no longer on disk")
+    if not req.clips:
         raise HTTPException(status_code=400, detail="Pick at least one clip to render")
-    data['shorts'] = approved
+    _apply_plan_edits(data, req.clips, _media_duration_seconds(source))
     write_json_atomic(meta_path, data, indent=2)
 
     settings = _read_review_settings(job_dir)
@@ -4483,16 +4573,72 @@ async def render_plan(job_id: str, req: PlanRenderRequest, request: Request):
     if settings.get("output_format") not in (None, "", "auto"):
         cmd.extend(["--format", settings["output_format"]])
 
-    try:
-        os.remove(os.path.join(job_dir, _REVIEW_MARKER))
-    except OSError:
-        pass
     job = jobs.setdefault(job_id, job)
-    job.update({'status': 'queued', 'cmd': cmd, 'env': env, 'output_dir': job_dir,
-                'plan_ready': False, 'result': None, 'ready_files': {}})
-    job['logs'].append(f"▶️ Rendering {len(approved)} approved clip(s).")
-    _enqueue_job(job_id, int(settings.get("priority") or 2))
-    return {"job_id": job_id, "status": "queued", "clips": len(approved)}
+    job.update({'cmd': cmd, 'env': env, 'output_dir': job_dir, 'plan_ready': False})
+    job.setdefault('ready_files', {})
+    pending = job.setdefault('render_pending', set())
+    for c in req.clips:
+        pending.add(c.index)
+        job.setdefault('render_failed', set()).discard(c.index)
+    names = ", ".join(str(c.index + 1) for c in req.clips)
+    job['logs'].append(f"▶️ Queued clip(s) {names} for rendering.")
+    if not job.get('render_enqueued'):
+        job['render_enqueued'] = True
+        _enqueue_job(job_id, int(settings.get("priority") or 2))
+    job['result'] = _review_result(job_id)
+    return job['result']
+
+
+async def _run_plan_render(job_id, job):
+    """One --render-plan run over the clips queued so far; the job stays in
+    review until every planned clip is rendered."""
+    job['render_enqueued'] = False
+    running = set(job.get('render_pending') or ())
+    job['render_pending'] = set()
+    job['render_running'] = running
+    if not running:
+        return
+    cmd = list(job['cmd']) + ["--clips", ",".join(str(i) for i in sorted(running))]
+    output_dir = job['output_dir']
+    job['result'] = _review_result(job_id)
+    print(f"🎬 [plan-render] {job_id}: {' '.join(cmd)}")
+    returncode = None
+    try:
+        priority = ({"creationflags": subprocess.BELOW_NORMAL_PRIORITY_CLASS} if os.name == "nt"
+                    else {"preexec_fn": _lower_priority})
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                   env=_job_encode_env(job['env']), cwd=os.getcwd(), **priority)
+        _job_processes[job_id] = process
+        threading.Thread(target=enqueue_output, args=(process.stdout, job_id), daemon=True).start()
+        while process.poll() is None:
+            await asyncio.sleep(2)
+            job['result'] = _review_result(job_id)
+        returncode = process.returncode
+    except Exception as e:
+        job['logs'].append(_scrub_secrets(f"Execution error: {e}"))
+    finally:
+        _job_processes.pop(job_id, None)
+        job['render_running'] = set()
+
+    result = _review_result(job_id) or {'clips': []}
+    done = {i for i, c in enumerate(result['clips']) if c['render_state'] == 'rendered'}
+    missing = running - done
+    if missing:
+        job.setdefault('render_failed', set()).update(missing)
+        names = ", ".join(str(i + 1) for i in sorted(missing))
+        code = f" (exit code {returncode})" if returncode else ""
+        job['logs'].append(f"⚠️ Clip(s) {names} did not render{code}.")
+        result = _review_result(job_id)
+    if result['clips'] and all(c['render_state'] == 'rendered' for c in result['clips']):
+        try:
+            os.remove(os.path.join(output_dir, _REVIEW_MARKER))
+        except OSError:
+            pass
+        job['status'] = 'completed'
+        job['logs'].append("Every clip of the plan is rendered.")
+    else:
+        job['status'] = 'review'
+    job['result'] = result
 
 
 def _locate_source(job_id: str):
@@ -5232,17 +5378,22 @@ async def get_clip_edl(job_id: str, clip_index: int, request: Request):
         current_file = _canonical_clip_file(output_dir, base_name, clip_index)
 
     total = recut.total_duration(segments)
+    # Review before render: nothing rendered yet, so the editor previews the
+    # source and its first render goes through the source path.
+    plan = _plan_clip_unrendered(job_id, clip_index)
     return {
         "job_id": job_id,
         "clip_index": clip_index,
+        "plan": plan,
         "title": clip.get('video_title_for_youtube_short') or '',
         "segments": segments,
         "framing": (clip.get('recipe') or {}).get('framing') or 'auto',
         "canonical_range": canonical_range,
         "duration": total,
         "current_file": current_file,
-        "has_captions": bool(re.match(r'^subtitled_\d+_',
-                                      watermarked.clean_name(current_file))),
+        "has_captions": (_plan_captions_on(job_id) if plan else
+                         bool(re.match(r'^subtitled_\d+_',
+                                       watermarked.clean_name(current_file)))),
         "words": words_out,
         "source": {
             "available": bool(source_path),
@@ -5257,7 +5408,7 @@ async def get_clip_edl(job_id: str, clip_index: int, request: Request):
         },
         "rerender_minutes": _cloud_config.EDITOR_ACTION_MINUTES if BILLING_ENABLED else 0,
         # What the unified editor shows as the clip's current layers.
-        "hook": clip.get('auto_hook') or None,
+        "hook": clip.get('auto_hook') or (_plan_hook(job_id, clip) if plan else None),
         "caption_style": clip.get('caption_style') or None,
         "caption_words_edited": bool(clip.get('caption_words')),
         "music": dict(zip(("available", "enabled", "volume"),
@@ -5328,11 +5479,24 @@ async def rerender_clip(req: RerenderRequest, request: Request):
     # read-modify-write below, with the last writer silently reverting the
     # other clip's recipe/video_url.
     lock = _rerender_locks.setdefault(req.job_id, asyncio.Lock())
-    async with lock:
-        return await _rerender_locked(req, request, job)
+    # Editor renders wait their turn with the pipeline's (one at a time).
+    async with render_semaphore:
+        async with lock:
+            plan = _plan_clip_unrendered(req.job_id, req.clip_index)
+            out = await _rerender_locked(req, request, job, plan=plan)
+    if job.get('status') == 'review':
+        result = _review_result(req.job_id)
+        job['result'] = result
+        if result and all(c['render_state'] == 'rendered' for c in result['clips']):
+            try:
+                os.remove(os.path.join(OUTPUT_DIR, req.job_id, _REVIEW_MARKER))
+            except OSError:
+                pass
+            job['status'] = 'completed'
+    return out
 
 
-async def _rerender_locked(req: RerenderRequest, request: Request, job):
+async def _rerender_locked(req: RerenderRequest, request: Request, job, plan=False):
     output_dir = os.path.join(OUTPUT_DIR, req.job_id)
     json_files = glob.glob(os.path.join(output_dir, "*_metadata.json"))
     if not json_files:
@@ -5392,7 +5556,7 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job):
     elif req.hook and (req.hook.get('text') or '').strip():
         hook = {k: req.hook.get(k) for k in HOOK_FIELDS}
     else:
-        hook = clip.get('auto_hook') or None
+        hook = clip.get('auto_hook') or (_plan_hook(req.job_id, clip) if plan else None)
     music_settings = dict(clip.get('music') or {})
     if req.music_enabled is not None:
         music_settings['enabled'] = bool(req.music_enabled)

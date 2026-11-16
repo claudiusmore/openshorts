@@ -2500,6 +2500,8 @@ if __name__ == '__main__':
     review_mode = parser.add_mutually_exclusive_group()
     review_mode.add_argument('--plan-only', action='store_true',
                              help="Stop after the AI picked the clips (metadata.json written), render nothing.")
+    parser.add_argument('--clips', type=str, default="",
+                        help="With --render-plan: comma-separated clip indexes (0-based) to render; default all.")
     review_mode.add_argument('--render-plan', action='store_true',
                              help="Render the clips in the output dir's metadata.json (a reviewed plan) "
                                   "without transcribing or asking the AI again.")
@@ -2796,8 +2798,11 @@ if __name__ == '__main__':
             if source_subtitle_band:
                 clips_data['source_subtitle_band'] = source_subtitle_band
             metadata_file = os.path.join(output_dir, f"{video_title}_metadata.json")
-            write_json_atomic(metadata_file, clips_data, indent=2)
-            print(f"   Saved metadata to {metadata_file}")
+            # A reviewed plan is the API's file: it keeps editing the clips not
+            # in this run, so only this run's clips are written back (below).
+            if reviewed_plan is None:
+                write_json_atomic(metadata_file, clips_data, indent=2)
+                print(f"   Saved metadata to {metadata_file}")
 
             if args.plan_only:
                 # The API shows this plan for review and starts the render
@@ -2897,18 +2902,23 @@ if __name__ == '__main__':
             # at 12 GB of 20 (bench, 25-sep-2026).
             clip_workers = max(int(os.environ.get("CLIP_WORKERS", "6")), 1)
             shorts = clips_data['shorts']
+            selected = list(range(len(shorts)))
+            if args.render_plan and args.clips.strip():
+                wanted = {int(x) for x in args.clips.split(",") if x.strip().isdigit()}
+                selected = [i for i in selected if i in wanted]
+            render_order = [i for i in clip_render_order(shorts) if i in selected]
             failed = []
             if os.environ.get("WATERMARK") == "1":
                 # Tells the /videos guard that the clean twins in this
                 # directory are not for serving (watermarked.MARKER_FILE).
                 import watermarked
                 watermarked.mark_job(output_dir)
-            with ThreadPoolExecutor(max_workers=min(clip_workers, len(shorts))) as pool:
+            with ThreadPoolExecutor(max_workers=max(1, min(clip_workers, len(render_order)))) as pool:
                 # Best clip first: the pool starts work in submission order, so
                 # the user's first delivered clip is the strongest one instead
                 # of whatever came first in the video.
                 futures = {pool.submit(_process_one_clip, i, shorts[i]): i
-                           for i in clip_render_order(shorts)}
+                           for i in render_order}
                 for future in as_completed(futures):
                     i = futures[future]
                     try:
@@ -2922,7 +2932,7 @@ if __name__ == '__main__':
             # condition on a busy card (22-sep-2026: 2 of 3 clips of a job "never
             # rendered" during a CUDA OOM burst). Try each one once more, alone,
             # after a pause and with the cache freed, before giving up on it.
-            for i in sorted(failed, key=lambda k: clip_render_order(shorts).index(k)):
+            for i in sorted(failed, key=lambda k: render_order.index(k)):
                 print(f"   🔁 Retrying clip {i+1} once…")
                 time.sleep(CLIP_RETRY_PAUSE_SECONDS)
                 _free_gpu_cache()
@@ -2934,7 +2944,15 @@ if __name__ == '__main__':
 
             # Persist per-clip render results added by the workers (auto_hook)
             # so the editor can see what is already burned into each clip.
-            if any('auto_hook' in c or 'hook_grounding' in c for c in shorts):
+            if reviewed_plan is not None:
+                # Re-read: the API may have saved edits to other clips meanwhile.
+                with open(metadata_file, 'r', encoding='utf-8') as f:
+                    fresh = json.load(f)
+                for i in selected:
+                    if i < len(fresh.get('shorts') or []):
+                        fresh['shorts'][i] = shorts[i]
+                write_json_atomic(metadata_file, fresh, indent=2)
+            elif any('auto_hook' in c or 'hook_grounding' in c for c in shorts):
                 # Atomic: the dashboard is already reading this file for the
                 # clips announced above (CLIP_READY).
                 write_json_atomic(metadata_file, clips_data, indent=2)

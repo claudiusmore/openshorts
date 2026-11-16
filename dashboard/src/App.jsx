@@ -5,7 +5,8 @@ import MediaInput from './components/MediaInput';
 import McpConnectCard from './components/McpConnectCard';
 import ResultCard from './components/ResultCard';
 import ProcessingAnimation from './components/ProcessingAnimation';
-import PlanReview from './components/PlanReview';
+import { PlanCard } from './components/PlanReview';
+import { usePlanData, renderPlanClips } from './lib/plan';
 // import Gallery from './components/Gallery';
 import ThumbnailStudio from './components/ThumbnailStudio';
 import SaaShortsTab from './components/SaaShortsTab';
@@ -357,6 +358,8 @@ function App() {
   // /api/subtitle, /api/edit and publishing, the clip-N.mp4 download name, the
   // saved per-clip project state). Sorting the array itself would silently
   // repoint all of that at the wrong clip.
+  const planData = usePlanData(jobId, status === 'review');
+  const [renderingAll, setRenderingAll] = useState(false);
   const rankedClips = useMemo(() => {
     const clips = results?.clips;
     if (!Array.isArray(clips)) return [];
@@ -382,6 +385,10 @@ function App() {
   // screen and it was pushing the actual clips a full scroll down.
   const [logsVisible, setLogsVisible] = useState(() => {
     try { return window.innerWidth >= 768; } catch { return true; }
+  });
+  // Job settings box in Live Analysis: open or collapsed, remembered.
+  const [settingsOpen, setSettingsOpen] = useState(() => {
+    try { return localStorage.getItem('os_settings_open') !== '0'; } catch { return true; }
   });
   const [processingMedia, setProcessingMedia] = useState(null);
   const [activeTab, setActiveTab] = useState('dashboard'); // dashboard, settings
@@ -862,7 +869,8 @@ function App() {
 
   useEffect(() => {
     let interval;
-    if ((status === 'processing' || status === 'completed') && jobId) {
+    // Review keeps polling too: clips queued from the plan render meanwhile.
+    if ((status === 'processing' || status === 'completed' || status === 'review') && jobId) {
       interval = setInterval(async () => {
         try {
           const data = await pollJob(jobId);
@@ -883,7 +891,6 @@ function App() {
               setLogs(data.logs);
               setLogTimes(data.log_times || []);
             }
-            clearInterval(interval);
           } else if (data.status === 'completed') {
             setQueueInfo(null);
             setStatus('complete');
@@ -2351,8 +2358,22 @@ function App() {
                 {/* What this job was created with — read only */}
                 {jobSettings?.jobId === jobId && jobSettings.items?.length > 0 && (
                   <div className="mb-4 rounded-card border border-rule bg-paper2 px-3.5 py-3">
-                    <p className="eyebrow mb-2">settings</p>
-                    <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-xs">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setSettingsOpen((open) => {
+                          try { localStorage.setItem('os_settings_open', open ? '0' : '1'); } catch { /* ignore */ }
+                          return !open;
+                        });
+                      }}
+                      className="w-full flex items-center justify-between"
+                      aria-expanded={settingsOpen}
+                    >
+                      <span className="eyebrow">settings</span>
+                      <ChevronDown size={14} className={`text-muted transition-transform ${settingsOpen ? 'rotate-180' : ''}`} />
+                    </button>
+                    {settingsOpen && (
+                    <dl className="mt-2 grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-xs">
                       {jobSettings.items.map(([label, value]) => (
                         <React.Fragment key={label}>
                           <dt className="text-muted lowercase whitespace-nowrap">{label}</dt>
@@ -2360,6 +2381,7 @@ function App() {
                         </React.Fragment>
                       ))}
                     </dl>
+                    )}
                   </div>
                 )}
 
@@ -2421,7 +2443,7 @@ function App() {
               </div>
 
               {/* Right Panel: Results Grid */}
-              <div className={`${status === 'complete' ? 'w-full md:w-[70%] lg:w-[75%]' : 'w-full md:w-[45%] lg:w-[40%]'} md:h-full flex flex-col shrink-0 md:shrink card p-3.5 sm:p-6 transition-all duration-700 ease-in-out`}>
+              <div className={`${status === 'complete' || status === 'review' ? 'w-full md:w-[70%] lg:w-[75%]' : 'w-full md:w-[45%] lg:w-[40%]'} md:h-full flex flex-col shrink-0 md:shrink card p-3.5 sm:p-6 transition-all duration-700 ease-in-out`}>
                 {/* Title + counters on one row, the two actions on their own row
                     below. Wrapping them all together dropped a lone half-width
                     "schedule week" pill under the title on a phone. */}
@@ -2439,6 +2461,36 @@ function App() {
                       </span>
                     )}
                   </h2>
+                  {status === 'review' && (() => {
+                    const waiting = rankedClips.filter(({ clip }) => clip.render_state === 'plan' || clip.render_state === 'failed');
+                    return (
+                      <div className="flex flex-col sm:flex-row sm:justify-between items-stretch sm:items-center gap-2">
+                        <p className="text-xs text-muted">
+                          Clips marked <b className="text-brass">preview</b> are not rendered yet: edit them, then render one by one or all at once.
+                          Renders run one at a time.
+                        </p>
+                        {waiting.length > 0 && (
+                          <button
+                            onClick={async () => {
+                              setRenderingAll(true);
+                              try {
+                                setResults(await renderPlanClips(jobId, waiting, apiKey));
+                              } catch (e) {
+                                alert(e.message);
+                              } finally {
+                                setRenderingAll(false);
+                              }
+                            }}
+                            disabled={renderingAll}
+                            className="btn-primary px-4 py-2 text-xs shrink-0"
+                          >
+                            {renderingAll ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />}
+                            render all ({waiting.length})
+                          </button>
+                        )}
+                      </div>
+                    );
+                  })()}
                   {results?.clips?.length > 0 && status === 'complete' && (
                     <div className="flex flex-col sm:flex-row sm:justify-end items-stretch sm:items-center gap-2">
                       <button
@@ -2588,18 +2640,24 @@ function App() {
                 )}
 
                 <div className="flex-1 overflow-y-auto custom-scrollbar p-1">
-                  {status === 'review' ? (
-                    <PlanReview
-                      jobId={jobId}
-                      geminiKey={apiKey}
-                      onRendered={() => {
-                        setResults(null);
-                        setStatus('processing');
-                      }}
-                    />
-                  ) : results && results.clips && results.clips.length > 0 ? (
-                    <div className={`grid gap-4 pb-10 ${status === 'complete' ? 'grid-cols-[repeat(auto-fill,minmax(min(100%,600px),1fr))]' : 'grid-cols-1'}`}>
+                  {results && results.clips && results.clips.length > 0 ? (
+                    <div className={`grid gap-4 pb-10 ${status === 'complete' || status === 'review' ? 'grid-cols-[repeat(auto-fill,minmax(min(100%,600px),1fr))]' : 'grid-cols-1'}`}>
                       {rankedClips.map(({ clip, index: i }) => (
+                        status === 'review' && clip.render_state && clip.render_state !== 'rendered' && !clip.video_url ? (
+                          planData ? (
+                            <PlanCard
+                              key={`${jobId}-${i}-plan`}
+                              clip={clip}
+                              index={i}
+                              jobId={jobId}
+                              plan={planData}
+                              geminiKey={apiKey}
+                              onResult={(result) => result && setResults(result)}
+                              onEditClip={(index) => setEditingClip(index)}
+                              editorBusy={clipRenders[`${jobId}:${i}`]?.status === 'rendering'}
+                            />
+                          ) : null
+                        ) : (
                         <ResultCard
                           key={`${jobId}-${i}-${clip.video_url || ''}`}
                           clip={clip}
@@ -2625,6 +2683,7 @@ function App() {
                           clipCount={results.clips.length}
                           bulkProgress={bulkSub}
                         />
+                        )
                       ))}
                     </div>
                   ) : (

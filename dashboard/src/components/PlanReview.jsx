@@ -1,13 +1,14 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Loader2, Play, Pause, Clapperboard, AlertTriangle } from 'lucide-react';
-import { apiFetch, apiJson } from '../lib/api';
+import React, { useMemo, useRef, useState } from 'react';
+import { Loader2, Scissors, Clapperboard, TrendingUp, AlertCircle, FileText, PenLine } from 'lucide-react';
+import { TEXT_FIELDS, editsOf, postPlan } from '../lib/plan';
 import { getApiUrl } from '../config';
+import Modal from './ui/Modal';
 
 // Review step of a job created with "review before rendering": the AI picked
-// the clips but nothing was rendered yet. Each clip is previewed over the
-// source video (center crop, hook and captions drawn in CSS as an
-// approximation of the burned ones), its cut and texts can be edited, and only
-// the approved clips go to the render.
+// the clips but they are not rendered yet. Each one shows as a card like the
+// rendered ones, previewed over the source video (center crop, hook and
+// captions drawn in CSS as an approximation of the burned ones), with its own
+// edit and render buttons.
 
 const HOOK_LOOK = {
     pill: { background: '#fff', color: '#000' },
@@ -19,7 +20,7 @@ const HOOK_LOOK = {
     outline_yellow: { color: '#FFD600', WebkitTextStroke: '1.5px #000', paintOrder: 'stroke fill' },
 };
 
-const ASPECT = { vertical: '9 / 16', auto: '9 / 16', square: '1 / 1', horizontal: '16 / 9' };
+const QUIET_BTN = 'group flex flex-col items-center justify-center gap-1 py-2.5 sm:py-2 px-1 rounded-input border border-rule hover:bg-paper3 text-[11px] lowercase text-ink2 whitespace-nowrap transition-colors disabled:opacity-45 disabled:cursor-not-allowed';
 
 // Same limit as the burned captions (subtitles.AUTO_CAPTION_STYLE max_chars).
 const CAPTION_MAX_CHARS = 16;
@@ -52,314 +53,343 @@ function spokenText(segments, start, end) {
     return segments.filter(([s, e]) => e > start && s < end).map(([, , t]) => t).join(' ');
 }
 
-const PlanReview = ({ jobId, geminiKey, onRendered }) => {
-    const [plan, setPlan] = useState(null);
-    const [clips, setClips] = useState([]);
-    const [error, setError] = useState('');
-    const [selected, setSelected] = useState(0);
-    const [videoSrc, setVideoSrc] = useState(null);
-    const [now, setNow] = useState(0);
-    const [playing, setPlaying] = useState(false);
-    const [submitting, setSubmitting] = useState(false);
-    const videoRef = useRef(null);
-
-    useEffect(() => {
-        let cancelled = false;
-        (async () => {
-            try {
-                const data = await apiJson(`/api/plan/${jobId}`);
-                if (cancelled) return;
-                setPlan(data);
-                setClips(data.clips.map((c) => ({ ...c, include: true })));
-                setVideoSrc(getApiUrl(data.source_url));
-            } catch (e) {
-                if (!cancelled) setError(e.detail || e.message || 'Could not load the plan.');
-            }
-        })();
-        return () => { cancelled = true; };
-    }, [jobId]);
-
-    const clip = clips[selected];
-    const cs = Number(clip?.start) || 0;
-    const ce = Number(clip?.end) || 0;
-    const chunks = useMemo(
-        () => (plan && clip ? captionChunks(plan.words, cs, ce) : []),
-        [plan, clip, cs, ce],
+// Hook and karaoke captions drawn over a source video, as an approximation of
+// what the render burns in. `words` are [start, end, text] in source seconds,
+// already limited to the cut; `time` is the source time on screen.
+export function PlanOverlay({ words, time, hookText, hookStyle, showHook, captions, compact = false }) {
+    const chunks = useMemo(() => captionChunks(words, -Infinity, Infinity), [words]);
+    const chunk = captions ? chunks.find((c, k) => time >= c.start
+        && time < Math.max(c.end, Math.min((chunks[k + 1]?.start ?? c.end + 0.5), c.end + 0.5))) : null;
+    return (
+        <>
+            {showHook && hookText && (
+                <div className="absolute left-0 right-0 top-[16%] flex justify-center px-3 pointer-events-none">
+                    <span
+                        className={`text-center font-extrabold leading-snug rounded-xl px-2.5 py-1 ${compact ? 'text-[13px]' : 'text-[16px]'}`}
+                        style={{ ...(HOOK_LOOK[hookStyle] || HOOK_LOOK.pill), boxDecorationBreak: 'clone', WebkitBoxDecorationBreak: 'clone' }}
+                    >
+                        {hookText}
+                    </span>
+                </div>
+            )}
+            {chunk && (
+                <div
+                    className="absolute left-0 right-0 bottom-[24%] text-center px-2 pointer-events-none uppercase"
+                    style={{ fontFamily: "'Anton-Regular', Impact, sans-serif", fontSize: compact ? 22 : 28, color: '#fff', WebkitTextStroke: '1.2px #000', paintOrder: 'stroke fill', letterSpacing: '0.02em' }}
+                >
+                    {chunk.words.map(([ws, we, w], k) => (
+                        <span key={k} style={time >= ws && time < we ? { color: '#FFE500' } : undefined}>
+                            {w}{k < chunk.words.length - 1 ? ' ' : ''}
+                        </span>
+                    ))}
+                </div>
+            )}
+            <style>{"@font-face{font-family:'Anton-Regular';src:url('/fonts/Anton-Regular.ttf') format('truetype');font-weight:400;}"}</style>
+        </>
     );
+}
 
-    const seek = (t) => {
-        const v = videoRef.current;
-        if (v) v.currentTime = t;
-        setNow(t);
-    };
-
-    const select = (i) => {
-        setSelected(i);
-        seek(Number(clips[i].start) || 0);
-    };
-
-    const togglePlay = () => {
-        const v = videoRef.current;
-        if (!v || !clip) return;
-        if (v.paused) {
-            if (v.currentTime < cs - 0.05 || v.currentTime >= ce - 0.05) v.currentTime = cs;
-            v.play();
-        } else {
-            v.pause();
-        }
-    };
+function Preview({ plan, clip, start, end, videoRef, now, setNow }) {
+    const words = useMemo(
+        () => plan.words.filter(([ws, we]) => we > start && ws < end), [plan, start, end]);
 
     const onTimeUpdate = () => {
         const v = videoRef.current;
-        if (!v || !clip) return;
+        if (!v) return;
         setNow(v.currentTime);
-        if (!v.paused && v.currentTime >= ce) {
+        if (!v.paused && v.currentTime >= end) {
             v.pause();
-            v.currentTime = ce;
+            v.currentTime = end;
         }
     };
-
-    const update = (i, patch) => setClips((prev) => prev.map((c, k) => (k === i ? { ...c, ...patch } : c)));
-
-    const render = async () => {
-        const approved = clips.filter((c) => c.include);
-        if (!approved.length) return;
-        setSubmitting(true);
-        setError('');
-        try {
-            const headers = { 'Content-Type': 'application/json' };
-            if (geminiKey) headers['X-Gemini-Key'] = geminiKey;
-            const res = await apiFetch(`/api/plan/${jobId}/render`, {
-                method: 'POST',
-                headers,
-                body: JSON.stringify({
-                    clips: approved.map(({ include: _include, ...c }) => ({
-                        ...c, start: Number(c.start), end: Number(c.end),
-                    })),
-                }),
-            });
-            if (!res.ok) {
-                let detail = await res.text();
-                try { detail = JSON.parse(detail).detail || detail; } catch { /* plain text */ }
-                throw new Error(typeof detail === 'string' ? detail : 'Render request failed');
-            }
-            onRendered();
-        } catch (e) {
-            setError(e.message);
-            setSubmitting(false);
-        }
+    const onPlay = () => {
+        const v = videoRef.current;
+        if (v && (v.currentTime < start - 0.05 || v.currentTime >= end - 0.05)) v.currentTime = start;
     };
-
-    if (error && !plan) {
-        return (
-            <div className="p-6 text-danger text-sm flex items-center gap-2">
-                <AlertTriangle size={16} /> {error}
-            </div>
-        );
-    }
-    if (!plan) {
-        return (
-            <div className="h-full min-h-[140px] flex items-center justify-center text-muted">
-                <Loader2 size={24} className="animate-spin text-brass" />
-            </div>
-        );
-    }
-
-    const t = now - cs;
-    const showHook = plan.hook.enabled && clip?.viral_hook_text && t >= 0 && t < plan.hook.seconds;
-    const chunk = plan.captions ? chunks.find((c, k) => now >= c.start
-        && now < Math.max(c.end, Math.min((chunks[k + 1]?.start ?? c.end + 0.5), c.end + 0.5))) : null;
-    const approvedCount = clips.filter((c) => c.include).length;
-    const windowStart = Math.max(0, cs - 10);
-    const windowEnd = ce + 10;
 
     return (
-        <div className="flex flex-col lg:flex-row gap-4 pb-10">
-            {/* Preview player */}
-            <div className="lg:w-[300px] shrink-0 lg:sticky lg:top-0 self-start w-full max-w-[340px] mx-auto">
-                <div
-                    className="relative w-full bg-black rounded-card overflow-hidden"
-                    style={{ aspectRatio: ASPECT[plan.output_format] || '9 / 16' }}
-                >
-                    {videoSrc && (
-                        <video
-                            ref={videoRef}
-                            src={videoSrc}
-                            className="absolute inset-0 w-full h-full object-cover"
-                            playsInline
-                            preload="metadata"
-                            onLoadedMetadata={() => clip && seek(cs)}
-                            onTimeUpdate={onTimeUpdate}
-                            onPlay={() => setPlaying(true)}
-                            onPause={() => setPlaying(false)}
-                            onClick={togglePlay}
-                        />
+        <>
+            <video
+                ref={videoRef}
+                src={getApiUrl(plan.source_url)}
+                controls
+                className="absolute inset-0 w-full h-full object-cover"
+                playsInline
+                preload="metadata"
+                onLoadedMetadata={(e) => { e.target.currentTime = start; setNow(start); }}
+                onTimeUpdate={onTimeUpdate}
+                onPlay={onPlay}
+            />
+            <PlanOverlay
+                words={words}
+                time={now}
+                hookText={clip.viral_hook_text}
+                hookStyle={plan.hook.style}
+                showHook={plan.hook.enabled && now - start >= 0 && now - start < plan.hook.seconds}
+                captions={plan.captions}
+                compact
+            />
+        </>
+    );
+}
+
+export function PlanCard({ clip, index, jobId, plan, geminiKey, onResult, onEditClip, editorBusy = false }) {
+    const videoRef = useRef(null);
+    const [now, setNow] = useState(Number(clip.start) || 0);
+    const [editing, setEditing] = useState(false);
+    const [draft, setDraft] = useState(null);
+    const [busy, setBusy] = useState(null); // 'save' | 'render'
+    const [error, setError] = useState('');
+
+    const start = Number(clip.start) || 0;
+    const end = Number(clip.end) || 0;
+    const state = clip.render_state;
+    const queued = state === 'queued' || state === 'rendering' || editorBusy;
+    const adjusted = Array.isArray(clip.adjusted) ? clip.adjusted : [start, end];
+
+    const openEdit = () => {
+        setDraft({ start, end, ...Object.fromEntries(TEXT_FIELDS.map((k) => [k, clip[k] || ''])) });
+        setError('');
+        setEditing(true);
+    };
+
+    // `fields` = the modal draft, or the clip as it is (render from the card).
+    const submit = async (render, fields) => {
+        setBusy(render ? 'render' : 'save');
+        setError('');
+        try {
+            const body = { clips: [editsOf(index, fields)] };
+            const result = await postPlan(`/api/plan/${jobId}/${render ? 'render' : 'clips'}`, body, geminiKey);
+            onResult(result);
+            setEditing(false);
+        } catch (e) {
+            setError(e.message);
+        } finally {
+            setBusy(null);
+        }
+    };
+
+    const seekCard = (t) => {
+        if (videoRef.current) videoRef.current.currentTime = t;
+        setNow(t);
+    };
+
+    return (
+        <div className="card overflow-hidden flex flex-col md:flex-row group hover:border-rule2 transition-colors animate-fade md:min-h-[420px]">
+            <div className="w-full max-w-[calc(64vh*0.5625)] md:max-w-none mx-auto md:mx-0 md:w-[236px] bg-black relative shrink-0 aspect-[9/16] md:aspect-auto overflow-hidden">
+                <Preview plan={plan} clip={clip} start={start} end={end} videoRef={videoRef} now={now} setNow={setNow} />
+                <div className="absolute top-3 left-3 flex flex-wrap gap-2 pointer-events-none">
+                    <span className="bg-black/70 text-ink font-mono text-micro uppercase px-2 py-1 rounded-full">
+                        Clip {index + 1}
+                    </span>
+                    {Number.isFinite(clip.predicted_score) && (
+                        <span className="bg-black/70 font-mono text-micro uppercase px-2 py-1 rounded-full flex items-center gap-1">
+                            <TrendingUp size={11} className="shrink-0 text-muted" />
+                            <span className="text-muted">viral</span>
+                            <b className={clip.predicted_score >= 80 ? 'text-ok' : clip.predicted_score >= 65 ? 'text-brass' : 'text-ink2'}>
+                                {clip.predicted_score}
+                            </b>
+                            <span className="text-muted">/100</span>
+                        </span>
                     )}
-                    {showHook && (
-                        <div className="absolute left-0 right-0 top-[16%] flex justify-center px-4 pointer-events-none">
-                            <span
-                                className="text-center font-extrabold leading-snug rounded-xl px-3 py-1.5 text-[15px]"
-                                style={{ ...(HOOK_LOOK[plan.hook.style] || HOOK_LOOK.pill), boxDecorationBreak: 'clone', WebkitBoxDecorationBreak: 'clone' }}
-                            >
-                                {clip.viral_hook_text}
-                            </span>
-                        </div>
-                    )}
-                    {chunk && (
-                        <div
-                            className="absolute left-0 right-0 bottom-[22%] text-center px-3 pointer-events-none uppercase"
-                            style={{ fontFamily: "'Anton-Regular', Impact, sans-serif", fontSize: 26, color: '#fff', WebkitTextStroke: '1.5px #000', paintOrder: 'stroke fill', letterSpacing: '0.02em' }}
-                        >
-                            {chunk.words.map(([ws, we, w], k) => (
-                                <span key={k} style={now >= ws && now < we ? { color: '#FFE500' } : undefined}>
-                                    {w}{k < chunk.words.length - 1 ? ' ' : ''}
-                                </span>
-                            ))}
-                        </div>
-                    )}
-                    <style>{"@font-face{font-family:'Anton-Regular';src:url('/fonts/Anton-Regular.ttf') format('truetype');font-weight:400;}"}</style>
+                    <span className="bg-brass/90 text-black font-mono text-micro uppercase px-2 py-1 rounded-full">preview</span>
                 </div>
-                {clip && (
-                    <div className="mt-2 space-y-1.5">
-                        <div className="flex items-center gap-2">
-                            <button type="button" onClick={togglePlay} className="btn-quiet p-1.5" aria-label={playing ? 'pause' : 'play'}>
-                                {playing ? <Pause size={14} /> : <Play size={14} />}
-                            </button>
-                            <input
-                                type="range"
-                                min={windowStart}
-                                max={windowEnd}
-                                step={0.1}
-                                value={Math.min(Math.max(now, windowStart), windowEnd)}
-                                onChange={(e) => seek(Number(e.target.value))}
-                                className="flex-1 accent-[var(--color-accent)]"
-                            />
-                        </div>
-                        <p className="font-mono text-[11px] text-muted text-center">
-                            {fmt(now)} · clip {fmt(cs)}–{fmt(ce)}
-                            {(now < cs || now > ce) && <span className="text-brass"> · outside the cut</span>}
+            </div>
+
+            <div className="flex-1 p-4 md:p-5 flex flex-col overflow-hidden min-w-0">
+                <div className="mb-3">
+                    <h3 className="text-base font-medium text-ink leading-tight line-clamp-2 mb-2 break-words">
+                        {clip.video_title_for_youtube_short || 'Untitled clip'}
+                    </h3>
+                    {clip.why && (
+                        <p className="text-xs text-ink2 leading-snug mb-2 break-words">
+                            <span className="text-muted">why the AI picked it: </span>{clip.why}
                         </p>
-                        <p className="text-[11px] leading-snug text-muted text-center">
-                            Approximate preview: center crop, hook and captions drawn in the browser.
-                            The final render follows the speaker.
+                    )}
+                    <div className="flex flex-wrap gap-1.5">
+                        <span className="readout bg-paper3 px-2 py-0.5 rounded-full">{(end - start).toFixed(1)}s</span>
+                        <span className="readout bg-paper3 px-2 py-0.5 rounded-full">{fmt(start)}–{fmt(end)}</span>
+                        <span className="readout bg-paper3 px-2 py-0.5 rounded-full">not rendered</span>
+                    </div>
+                </div>
+
+                <div className="flex-1 min-h-0 space-y-2 mb-4">
+                    <div className="bg-paper rounded-input px-3 py-2 border border-rule flex items-center gap-2 min-w-0">
+                        <span className="eyebrow shrink-0">HOOK</span>
+                        <p className="text-xs text-ink2 truncate flex-1 min-w-0">{clip.viral_hook_text || '—'}</p>
+                    </div>
+                    <div className="bg-paper rounded-input px-3 py-2 border border-rule flex items-center gap-2 min-w-0">
+                        <span className="eyebrow shrink-0">TIKTOK · IG</span>
+                        <p className="text-xs text-ink2 truncate flex-1 min-w-0">
+                            {clip.video_description_for_tiktok || clip.video_description_for_instagram || '—'}
                         </p>
                     </div>
-                )}
-            </div>
+                    <details className="text-xs">
+                        <summary className="cursor-pointer text-muted inline-flex items-center gap-1.5">
+                            <FileText size={12} /> what is said in this cut
+                        </summary>
+                        <p className="mt-1.5 leading-relaxed text-ink2">
+                            {spokenText(plan.segments, start, end) || '(no speech)'}
+                        </p>
+                    </details>
+                </div>
 
-            {/* Clips */}
-            <div className="flex-1 min-w-0 space-y-3">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                    <p className="text-sm text-ink">
-                        <b>{clips.length}</b> clips picked · nothing rendered yet. Review, edit and approve.
-                    </p>
+                {state === 'failed' && (
+                    <div className="mb-3 px-3 py-2 rounded-input text-xs text-danger bg-[color-mix(in_oklab,var(--color-danger)_10%,transparent)] flex items-center gap-2">
+                        <AlertCircle size={14} className="shrink-0" /> render failed — check the log and try again
+                    </div>
+                )}
+                {queued && (
+                    <div className="mb-3 px-3 py-2 rounded-input text-xs text-ink2 bg-paper3 flex items-center gap-2 lowercase">
+                        <Loader2 size={14} className="shrink-0 animate-spin text-brass" />
+                        {state === 'rendering' || editorBusy ? 'rendering this clip…' : 'in line to render'}
+                    </div>
+                )}
+                {error && !editing && <p className="mb-3 text-xs text-danger">{error}</p>}
+
+                <div className="grid grid-cols-3 gap-2 mt-auto pt-4 border-t border-rule">
                     <button
                         type="button"
-                        onClick={render}
-                        disabled={submitting || !approvedCount}
-                        className="btn-primary !w-auto px-4 py-2 text-sm flex items-center gap-2"
+                        onClick={() => onEditClip(index)}
+                        disabled={queued}
+                        className={QUIET_BTN}
+                        title="cut, framing, captions, hook and music, previewed before the render"
                     >
-                        {submitting ? <Loader2 size={14} className="animate-spin" /> : <Clapperboard size={14} />}
-                        Render {approvedCount} clip{approvedCount === 1 ? '' : 's'}
+                        <Scissors size={16} className="text-muted group-hover:text-brass transition-colors shrink-0" />
+                        edit
+                    </button>
+                    <button type="button" onClick={openEdit} disabled={queued} className={QUIET_BTN} title="title, descriptions and the AI's cut">
+                        <PenLine size={16} className="text-muted group-hover:text-brass transition-colors shrink-0" />
+                        texts &amp; ai cut
+                    </button>
+                    <button
+                        type="button"
+                        onClick={() => submit(true, clip)}
+                        disabled={queued || !!busy}
+                        className="btn-primary flex-col gap-1 py-2.5 sm:py-2 px-1 text-[11px] leading-none rounded-input whitespace-nowrap"
+                    >
+                        {busy === 'render' ? <Loader2 size={16} className="animate-spin shrink-0" /> : <Clapperboard size={16} className="shrink-0" />}
+                        render
                     </button>
                 </div>
-                {error && <p className="text-danger text-sm">{error}</p>}
+            </div>
 
-                {clips.map((c, i) => {
-                    const active = i === selected;
-                    const length = Number(c.end) - Number(c.start);
-                    return (
-                        <div
-                            key={c.index}
-                            className={`card p-3.5 space-y-2.5 transition-opacity ${active ? 'ring-1 ring-brass' : ''} ${c.include ? '' : 'opacity-50'}`}
-                        >
-                            <div className="flex items-center justify-between gap-2">
-                                <label className="flex items-center gap-2 text-sm text-ink cursor-pointer select-none">
-                                    <input
-                                        type="checkbox"
-                                        checked={c.include}
-                                        onChange={(e) => update(i, { include: e.target.checked })}
-                                        className="w-4 h-4 accent-[var(--color-accent)]"
-                                    />
-                                    Clip {c.index + 1}
-                                    <span className="font-mono text-xs text-muted">{length.toFixed(1)}s</span>
-                                </label>
-                                <button type="button" onClick={() => select(i)} className="btn-quiet py-1 px-2.5 text-xs lowercase flex items-center gap-1.5">
-                                    <Play size={12} /> preview
-                                </button>
-                            </div>
+            <Modal
+                isOpen={editing}
+                onClose={() => !busy && setEditing(false)}
+                eyebrow={`CLIP ${index + 1} · NOT RENDERED`}
+                title="texts and the AI's cut"
+                size="md"
+                footer={(
+                    <div className="flex flex-wrap justify-end gap-2">
+                        <button type="button" onClick={() => setEditing(false)} disabled={!!busy} className="btn-ghost px-3 py-2 text-xs">cancel</button>
+                        <button type="button" onClick={() => submit(false, draft)} disabled={!!busy} className="btn-ghost px-3 py-2 text-xs">
+                            {busy === 'save' && <Loader2 size={14} className="animate-spin" />} save
+                        </button>
+                        <button type="button" onClick={() => submit(true, draft)} disabled={!!busy} className="btn-primary !w-auto px-4 py-2 text-xs">
+                            {busy === 'render' ? <Loader2 size={14} className="animate-spin" /> : <Clapperboard size={14} />} save &amp; render
+                        </button>
+                    </div>
+                )}
+            >
+                {draft && (
+                    <div className="space-y-3">
+                        {clip.why && (
+                            <p className="text-xs text-ink2 leading-relaxed">
+                                <span className="text-muted">why the AI picked it: </span>{clip.why}
+                                {Number.isFinite(clip.predicted_score) && <span className="text-muted"> · score {clip.predicted_score}/100</span>}
+                            </p>
+                        )}
 
-                            <div className="grid grid-cols-2 gap-2">
-                                {['start', 'end'].map((field) => (
-                                    <div key={field} className="flex items-center gap-1.5">
-                                        <span className="text-xs text-muted w-8">{field}</span>
-                                        <input
-                                            type="number"
-                                            step="0.1"
-                                            min="0"
-                                            value={c[field]}
-                                            onChange={(e) => update(i, { [field]: e.target.value })}
-                                            className="input-field !py-1 text-xs font-mono"
-                                        />
+                        <div className="rounded-input bg-paper2 border border-rule px-2.5 py-2 space-y-1 text-[11px] font-mono">
+                            {[
+                                ['AI pick', Array.isArray(clip.proposed) ? clip.proposed : null],
+                                ['adjusted', adjusted],
+                            ].filter(([, r]) => r).map(([label, [a, b]]) => {
+                                const current = Math.abs(Number(draft.start) - a) < 0.05 && Math.abs(Number(draft.end) - b) < 0.05;
+                                return (
+                                    <div key={label} className="flex items-center justify-between gap-2">
+                                        <span className={current ? 'text-ink' : 'text-muted'}>
+                                            {label} · {fmt(a)}–{fmt(b)} · {(b - a).toFixed(1)}s{current ? ' ✓' : ''}
+                                        </span>
                                         <button
                                             type="button"
-                                            disabled={!active}
-                                            title="Use the player's current time"
-                                            onClick={() => update(i, { [field]: Number(now.toFixed(2)) })}
-                                            className="btn-quiet py-1 px-1.5 text-[11px] lowercase whitespace-nowrap"
+                                            disabled={current}
+                                            onClick={() => { setDraft((d) => ({ ...d, start: a, end: b })); seekCard(a); }}
+                                            className="btn-quiet py-0.5 px-2 text-[11px] lowercase font-sans"
                                         >
-                                            = now
+                                            use
                                         </button>
                                     </div>
-                                ))}
-                            </div>
-
-                            <label className="block">
-                                <span className="text-xs text-muted">hook (on screen for the first {plan.hook.seconds}s{plan.hook.enabled ? '' : ' — auto hook is off for this job'})</span>
-                                <input
-                                    value={c.viral_hook_text}
-                                    onChange={(e) => update(i, { viral_hook_text: e.target.value })}
-                                    className="input-field !py-1.5 text-sm"
-                                />
-                            </label>
-                            <label className="block">
-                                <span className="text-xs text-muted">title</span>
-                                <input
-                                    value={c.video_title_for_youtube_short}
-                                    onChange={(e) => update(i, { video_title_for_youtube_short: e.target.value })}
-                                    className="input-field !py-1.5 text-sm"
-                                />
-                            </label>
-                            <label className="block">
-                                <span className="text-xs text-muted">description (TikTok)</span>
-                                <textarea
-                                    rows={2}
-                                    value={c.video_description_for_tiktok}
-                                    onChange={(e) => update(i, { video_description_for_tiktok: e.target.value })}
-                                    className="input-field !py-1.5 text-sm resize-y"
-                                />
-                            </label>
-                            <label className="block">
-                                <span className="text-xs text-muted">description (Instagram)</span>
-                                <textarea
-                                    rows={2}
-                                    value={c.video_description_for_instagram}
-                                    onChange={(e) => update(i, { video_description_for_instagram: e.target.value })}
-                                    className="input-field !py-1.5 text-sm resize-y"
-                                />
-                            </label>
-                            <details className="text-xs">
-                                <summary className="cursor-pointer text-muted">what is said in this cut</summary>
-                                <p className="mt-1.5 leading-relaxed text-ink2 whitespace-pre-wrap">
-                                    {spokenText(plan.segments, Number(c.start), Number(c.end)) || '(no speech)'}
-                                </p>
-                            </details>
+                                );
+                            })}
+                            <p className="font-sans text-muted leading-snug">
+                                &quot;adjusted&quot; is the AI pick after the length limit and the snap to sentence ends.
+                            </p>
                         </div>
-                    );
-                })}
-            </div>
+
+                        <div className="grid grid-cols-2 gap-2">
+                            {['start', 'end'].map((field) => (
+                                <div key={field} className="flex items-center gap-1.5">
+                                    <span className="text-xs text-muted w-8">{field}</span>
+                                    <input
+                                        type="number"
+                                        step="0.1"
+                                        min="0"
+                                        value={draft[field]}
+                                        onChange={(e) => setDraft((d) => ({ ...d, [field]: e.target.value }))}
+                                        className="input-field !py-1 text-xs font-mono"
+                                    />
+                                    <button
+                                        type="button"
+                                        title="Use the card player's current time"
+                                        onClick={() => setDraft((d) => ({ ...d, [field]: Number(now.toFixed(2)) }))}
+                                        className="btn-quiet py-1 px-1.5 text-[11px] lowercase whitespace-nowrap"
+                                    >
+                                        = player
+                                    </button>
+                                </div>
+                            ))}
+                        </div>
+                        <p className="text-[11px] text-muted">
+                            {(Number(draft.end) - Number(draft.start)).toFixed(1)}s · the card player is at {fmt(now)}
+                        </p>
+
+                        {[
+                            ['viral_hook_text', `hook (on screen for the first ${plan.hook.seconds}s${plan.hook.enabled ? '' : ' — auto hook is off for this job'})`, false],
+                            ['video_title_for_youtube_short', 'title', false],
+                            ['video_description_for_tiktok', 'description (TikTok)', true],
+                            ['video_description_for_instagram', 'description (Instagram)', true],
+                        ].map(([field, label, multi]) => (
+                            <label key={field} className="block">
+                                <span className="text-xs text-muted">{label}</span>
+                                {multi ? (
+                                    <textarea
+                                        rows={3}
+                                        value={draft[field]}
+                                        onChange={(e) => setDraft((d) => ({ ...d, [field]: e.target.value }))}
+                                        className="input-field !py-1.5 text-sm resize-y"
+                                    />
+                                ) : (
+                                    <input
+                                        value={draft[field]}
+                                        onChange={(e) => setDraft((d) => ({ ...d, [field]: e.target.value }))}
+                                        className="input-field !py-1.5 text-sm"
+                                    />
+                                )}
+                            </label>
+                        ))}
+
+                        <details className="text-xs">
+                            <summary className="cursor-pointer text-muted">what is said in this cut</summary>
+                            <p className="mt-1.5 leading-relaxed text-ink2">
+                                {spokenText(plan.segments, Number(draft.start), Number(draft.end)) || '(no speech)'}
+                            </p>
+                        </details>
+                        {error && <p className="text-xs text-danger">{error}</p>}
+                    </div>
+                )}
+            </Modal>
         </div>
     );
-};
-
-export default PlanReview;
+}
