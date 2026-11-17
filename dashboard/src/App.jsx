@@ -6,7 +6,8 @@ import McpConnectCard from './components/McpConnectCard';
 import ResultCard from './components/ResultCard';
 import ProcessingAnimation from './components/ProcessingAnimation';
 import { PlanCard } from './components/PlanReview';
-import { usePlanData, renderPlanClips } from './lib/plan';
+import { usePlanData, renderPlanClips, postPlan } from './lib/plan';
+import YoutubePostModal from './components/YoutubePostModal';
 // import Gallery from './components/Gallery';
 import ThumbnailStudio from './components/ThumbnailStudio';
 import SaaShortsTab from './components/SaaShortsTab';
@@ -360,6 +361,8 @@ function App() {
   // repoint all of that at the wrong clip.
   const planData = usePlanData(jobId, status === 'review');
   const [renderingAll, setRenderingAll] = useState(false);
+  const [creatingShort, setCreatingShort] = useState(false);
+  const [showYoutube, setShowYoutube] = useState(false);
   const rankedClips = useMemo(() => {
     const clips = results?.clips;
     if (!Array.isArray(clips)) return [];
@@ -405,6 +408,47 @@ function App() {
   const [showScheduleWeek, setShowScheduleWeek] = useState(false);
   // Clip editor overlay: index of the clip being edited, or null.
   const [editingClip, setEditingClip] = useState(null);
+
+  // Shared by the review and the finished views of a job.
+  const renderedClips = (results?.clips || [])
+    .map((clip, index) => ({ clip, index }))
+    .filter(({ clip }) => clip.video_url && (!clip.render_state || clip.render_state === 'rendered'));
+  const createShort = async () => {
+    setCreatingShort(true);
+    try {
+      const data = await postPlan(`/api/plan/${jobId}/new`, {}, apiKey);
+      setResults(data.result);
+      setStatus('review');
+      setEditingClip(data.index);
+    } catch (e) {
+      alert(e.message);
+    } finally {
+      setCreatingShort(false);
+    }
+  };
+  const jobActions = (
+    <>
+      <button
+        onClick={createShort}
+        disabled={creatingShort}
+        className="btn-ghost px-3 py-2 text-xs shrink-0"
+        title="Make a short from any part of the original video"
+      >
+        {creatingShort ? <Loader2 size={14} className="animate-spin" /> : <Plus size={14} />}
+        new
+      </button>
+      {renderedClips.length > 0 && (
+        <button
+          onClick={() => setShowYoutube(true)}
+          className="btn-ghost px-3 py-2 text-xs shrink-0"
+          title="Post rendered clips to YouTube, one every hour"
+        >
+          <Youtube size={14} />
+          youtube
+        </button>
+      )}
+    </>
+  );
   const [reframingClip, setReframingClip] = useState(null);
   // `${jobId}:${index}` -> { status: 'rendering' | 'error', message } for
   // editor renders that keep going after the editor is closed.
@@ -2469,6 +2513,8 @@ function App() {
                           Clips marked <b className="text-brass">preview</b> are not rendered yet: edit them, then render one by one or all at once.
                           Renders run one at a time.
                         </p>
+                        <div className="flex flex-wrap items-center gap-2 shrink-0">
+                        {jobActions}
                         {waiting.length > 0 && (
                           <button
                             onClick={async () => {
@@ -2488,11 +2534,13 @@ function App() {
                             render all ({waiting.length})
                           </button>
                         )}
+                        </div>
                       </div>
                     );
                   })()}
                   {results?.clips?.length > 0 && status === 'complete' && (
                     <div className="flex flex-col sm:flex-row sm:justify-end items-stretch sm:items-center gap-2">
+                      {jobActions}
                       <button
                         onClick={handleDownloadAll}
                         disabled={downloadingAll}
@@ -2665,6 +2713,7 @@ function App() {
                           jobId={jobId}
                           onEditClip={(index) => setEditingClip(index)}
                           onReframeClip={(index) => setReframingClip(index)}
+                          onTextsUpdated={(result) => result && setResults(result)}
                           renderState={clipRenders[`${jobId}:${i}`] || null}
                           onUpgrade={isManaged ? openUpsell : null}
                           initialState={projectState?.clips?.find((c) => c.index === i) || null}
@@ -2845,6 +2894,9 @@ function App() {
       )}
 
 
+      {showYoutube && (
+        <YoutubePostModal jobId={jobId} clips={renderedClips} onClose={() => setShowYoutube(false)} />
+      )}
       {editingClip !== null && results?.clips?.[editingClip] && (
         <ClipEditor
           jobId={jobId}

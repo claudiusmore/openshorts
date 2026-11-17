@@ -34,6 +34,9 @@ import layout_ranges
 import watermarked
 import media_auth
 from jsonfile import write_json_atomic
+import youtube_studio
+import youtube_queue
+import clip_texts
 
 load_dotenv()
 
@@ -2780,6 +2783,9 @@ async def lifespan(app: FastAPI):
     # Start worker and cleanup
     worker_task = asyncio.create_task(process_queue())
     cleanup_task = asyncio.create_task(cleanup_jobs())
+    if not BILLING_ENABLED:
+        # Local installs only: posts through the user's own Chrome (youtube_studio.py).
+        asyncio.create_task(youtube_queue.worker(_youtube_clip_path, is_active=lambda: not _draining))
     if BILLING_ENABLED:
         await cloud.setup_async(app, keep_reservation_ids=_resumed_reservation_ids)
         # Account erasure lives in cloud/, which can't import app.py; hand it the
@@ -4639,6 +4645,178 @@ async def _run_plan_render(job_id, job):
     else:
         job['status'] = 'review'
     job['result'] = result
+
+
+class NewPlanClip(BaseModel):
+    start: Optional[float] = None
+    end: Optional[float] = None
+
+
+@app.post("/api/plan/{job_id}/new")
+async def new_plan_clip(job_id: str, req: NewPlanClip, request: Request):
+    """Add a short of any stretch of the source to the plan, unrendered.
+
+    A finished job goes back to review so the new clip gets a preview card
+    and the same edit/render path as the AI's picks."""
+    job = jobs.get(job_id) or _job_view_from_disk(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    await _assert_job_owner(request, job)
+    if job.get('status') not in ('review', 'completed'):
+        raise HTTPException(status_code=409, detail="Wait for the analysis to finish")
+    job_dir = os.path.join(OUTPUT_DIR, job_id)
+    metas = glob.glob(os.path.join(job_dir, "*_metadata.json"))
+    source = _locate_source(job_id)
+    if not metas or not source:
+        raise HTTPException(status_code=404, detail="Source video is no longer on disk")
+    with open(metas[0], encoding="utf-8") as f:
+        data = json.load(f)
+    duration = _media_duration_seconds(source) or 0
+    start = max(0.0, req.start or 0.0)
+    end = req.end if req.end is not None else start + 30
+    if duration > 0:
+        end = min(end, duration)
+        start = min(start, max(0.0, end - 3))
+    if end - start < 3:
+        raise HTTPException(status_code=400, detail="A short must be at least 3 s long")
+    shorts = data.setdefault('shorts', [])
+    shorts.append({'start': round(start, 2), 'end': round(end, 2), 'manual': True,
+                   **{k: "" for k in _PLAN_TEXT_FIELDS}})
+    write_json_atomic(metas[0], data, indent=2)
+    if job.get('status') != 'review':
+        open(os.path.join(job_dir, _REVIEW_MARKER), "w").close()
+    job = jobs.setdefault(job_id, job)
+    job['status'] = 'review'
+    job.setdefault('logs', [])
+    job['result'] = _review_result(job_id)
+    return {"index": len(shorts) - 1, "result": job['result']}
+
+
+_CLIP_TEXT_KEYS = (*_PLAN_TEXT_FIELDS, "why", "predicted_score")
+
+
+@app.post("/api/clip/{job_id}/{clip_index}/texts")
+async def regenerate_clip_texts(job_id: str, clip_index: int, request: Request):
+    """Have the AI rewrite a clip's hook, title, descriptions, why and score
+    from what is said inside its current cut. A rendered clip keeps its
+    burned-in hook until it is rendered again."""
+    job = jobs.get(job_id) or _job_view_from_disk(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    await _assert_job_owner(request, job)
+    if job.get('status') not in ('review', 'completed'):
+        raise HTTPException(status_code=409, detail="Wait for the analysis to finish")
+    metas = glob.glob(os.path.join(OUTPUT_DIR, job_id, "*_metadata.json"))
+    if not metas:
+        raise HTTPException(status_code=404, detail="Metadata not found")
+    with open(metas[0], encoding="utf-8") as f:
+        data = json.load(f)
+    shorts = data.get('shorts') or []
+    if not 0 <= clip_index < len(shorts):
+        raise HTTPException(status_code=404, detail="Clip not found")
+    shown = ((job.get('result') or {}).get('clips') or [])
+    shown = shown[clip_index] if clip_index < len(shown) else {}
+    start = float(shown.get('start', shorts[clip_index].get('start')) or 0)
+    end = float(shown.get('end', shorts[clip_index].get('end')) or 0)
+    title = os.path.basename(metas[0])[:-len("_metadata.json")]
+    try:
+        texts = await asyncio.to_thread(
+            clip_texts.generate, (data.get('transcript') or {}).get('segments'),
+            start, end, title, await resolve_gemini(request))
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=_scrub_secrets(f"AI request failed: {e}")[:300])
+    shorts[clip_index].update(texts)
+    write_json_atomic(metas[0], data, indent=2)
+    job = jobs.setdefault(job_id, job)
+    if job.get('status') == 'review':
+        job['result'] = _review_result(job_id)
+    elif shown:
+        shown.update(texts)
+    return {"texts": texts, "result": job.get('result')}
+
+
+def _youtube_clip_path(job_id, clip_index):
+    """The rendered file of a clip as served right now, or None."""
+    from urllib.parse import unquote
+    job = jobs.get(job_id) or _job_view_from_disk(job_id) or {}
+    result = _review_result(job_id) if job.get('status') == 'review' else job.get('result')
+    clips = (result or {}).get('clips') or []
+    if not 0 <= clip_index < len(clips):
+        return None
+    url = clips[clip_index].get('video_url') or ''
+    prefix = f"/videos/{job_id}/"
+    if not url.startswith(prefix):
+        return None
+    path = os.path.join(OUTPUT_DIR, job_id, os.path.basename(unquote(url[len(prefix):].split('?')[0])))
+    return os.path.abspath(path) if os.path.isfile(path) else None
+
+
+class YoutubeClip(BaseModel):
+    index: int
+    title: str
+    description: Optional[str] = None
+
+
+class YoutubeScheduleRequest(BaseModel):
+    job_id: str
+    account: str
+    visibility: str = "public"
+    start_at: float  # epoch seconds of the first post
+    interval_minutes: float = 60
+    clips: List[YoutubeClip]
+
+
+def _youtube_public(item):
+    return {k: item.get(k) for k in ("id", "job_id", "clip_index", "title", "account", "visibility",
+                                     "publish_at", "status", "error", "url", "updated_at")}
+
+
+@app.get("/api/youtube/accounts")
+async def youtube_accounts():
+    return {"accounts": youtube_studio.list_accounts()}
+
+
+@app.get("/api/youtube/queue")
+async def youtube_queue_list(job_id: Optional[str] = None):
+    items = [it for it in youtube_queue.load() if not job_id or it["job_id"] == job_id]
+    return {"items": [_youtube_public(it) for it in sorted(items, key=lambda it: it["publish_at"])]}
+
+
+@app.post("/api/youtube/schedule")
+async def youtube_schedule(req: YoutubeScheduleRequest, request: Request):
+    """Queue clips for YouTube, one every ``interval_minutes`` from ``start_at``."""
+    job = jobs.get(req.job_id) or _job_view_from_disk(req.job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    await _assert_job_owner(request, job)
+    if req.account not in youtube_studio.list_accounts():
+        raise HTTPException(status_code=400, detail=f"YouTube account '{req.account}' is not signed in")
+    if req.visibility not in youtube_queue.VISIBILITIES:
+        raise HTTPException(status_code=400, detail="Unknown visibility")
+    if not req.clips:
+        raise HTTPException(status_code=400, detail="Pick at least one clip")
+    entries = []
+    for n, c in enumerate(req.clips):
+        title = c.title.strip()[:100]
+        if not title:
+            raise HTTPException(status_code=400, detail=f"Clip {c.index + 1} needs a title")
+        if not _youtube_clip_path(req.job_id, c.index):
+            raise HTTPException(status_code=400, detail=f"Clip {c.index + 1} is not rendered")
+        entries.append({"job_id": req.job_id, "clip_index": c.index, "title": title,
+                        "description": (c.description if c.description is not None else title).strip(),
+                        "account": req.account, "visibility": req.visibility,
+                        "publish_at": req.start_at + n * max(0.0, req.interval_minutes) * 60})
+    youtube_queue.add(entries)
+    return await youtube_queue_list(req.job_id)
+
+
+@app.delete("/api/youtube/queue/{item_id}")
+async def youtube_unschedule(item_id: str):
+    if not youtube_queue.cancel(item_id):
+        raise HTTPException(status_code=409, detail="Only scheduled or failed posts can be removed")
+    return {"ok": True}
 
 
 def _locate_source(job_id: str):
