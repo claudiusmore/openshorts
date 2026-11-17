@@ -2948,9 +2948,15 @@ if __name__ == '__main__':
                 # Re-read: the API may have saved edits to other clips meanwhile.
                 with open(metadata_file, 'r', encoding='utf-8') as f:
                     fresh = json.load(f)
+                # Texts edited during the render (AI texts) win over the copy
+                # this run read at its start.
+                text_keys = ("viral_hook_text", "video_title_for_youtube_short",
+                             "video_description_for_tiktok", "video_description_for_instagram",
+                             "why", "predicted_score")
                 for i in selected:
                     if i < len(fresh.get('shorts') or []):
-                        fresh['shorts'][i] = shorts[i]
+                        old = fresh['shorts'][i]
+                        fresh['shorts'][i] = {**shorts[i], **{k: old[k] for k in text_keys if k in old}}
                 write_json_atomic(metadata_file, fresh, indent=2)
             elif any('auto_hook' in c or 'hook_grounding' in c for c in shorts):
                 # Atomic: the dashboard is already reading this file for the

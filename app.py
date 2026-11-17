@@ -4359,6 +4359,13 @@ async def get_status(job_id: str, request: Request):
         # Set when only the first part of the source was clipped (quota wall
         # offer), so the dashboard can say so next to the clips.
         "partial": job.get('partial'),
+        # Clips waiting for / holding the render line, by index.
+        "renders": {
+            **{str(i): 'queued' for i in (job.get('render_pending') or ())},
+            **{str(i): 'queued' for i in (job.get('editor_pending') or ())},
+            **{str(i): 'rendering' for i in (job.get('render_running') or ())},
+            **{str(i): 'rendering' for i in (job.get('editor_active') or ())},
+        },
     }
 
 
@@ -4487,21 +4494,28 @@ def _review_result(job_id):
         data = json.load(f)
     base = os.path.basename(metas[0])[:-len("_metadata.json")]
     ready = job.get('ready_files') or {}
+    running = set(job.get('render_running') or ()) | set(job.get('editor_running') or ())
+    pending = set(job.get('render_pending') or ()) | set(job.get('editor_pending') or ())
     clips = []
     for i, c in enumerate(data.get('shorts') or []):
         c = dict(c)
         c.pop('video_url', None)
         name = ready.get(i) or _canonical_clip_file(job_dir, base, i)
-        try:
-            rendered = os.path.getsize(os.path.join(job_dir, name)) > 0
-        except OSError:
+        # A clip still rendering has files on disk that ffmpeg is writing; only
+        # the one announced by CLIP_READY (or left after the run) is playable.
+        if i in running and i not in ready:
             rendered = False
+        else:
+            try:
+                rendered = os.path.getsize(os.path.join(job_dir, name)) > 0
+            except OSError:
+                rendered = False
         if rendered:
             c['video_url'] = f"/videos/{job_id}/{name}"
             c['render_state'] = 'rendered'
-        elif i in job.get('render_running', ()):
+        elif i in running:
             c['render_state'] = 'rendering'
-        elif i in job.get('render_pending', ()):
+        elif i in pending:
             c['render_state'] = 'queued'
         elif i in job.get('render_failed', ()):
             c['render_state'] = 'failed'
@@ -4604,6 +4618,9 @@ async def _run_plan_render(job_id, job):
     job['render_running'] = running
     if not running:
         return
+    ready = job.setdefault('ready_files', {})
+    for i in running:
+        ready.pop(i, None)
     cmd = list(job['cmd']) + ["--clips", ",".join(str(i) for i in sorted(running))]
     output_dir = job['output_dir']
     job['result'] = _review_result(job_id)
@@ -5657,11 +5674,33 @@ async def rerender_clip(req: RerenderRequest, request: Request):
     # read-modify-write below, with the last writer silently reverting the
     # other clip's recipe/video_url.
     lock = _rerender_locks.setdefault(req.job_id, asyncio.Lock())
-    # Editor renders wait their turn with the pipeline's (one at a time).
-    async with render_semaphore:
-        async with lock:
-            plan = _plan_clip_unrendered(req.job_id, req.clip_index)
-            out = await _rerender_locked(req, request, job, plan=plan)
+    # Editor renders wait their turn in the same line as the plan renders of
+    # the Generated Shorts grid (render_semaphore, one at a time); the sets
+    # below let the status poll show them as queued / rendering there.
+    idx = req.clip_index
+    pending = job.setdefault('editor_pending', set())
+    running = job.setdefault('editor_running', set())
+    pending.add(idx)
+    if job.get('status') == 'review':
+        job['result'] = _review_result(req.job_id)
+    try:
+        if render_semaphore.locked():
+            job['logs'].append(f"⏳ Clip {idx + 1} (editor) is in line to render…")
+        async with render_semaphore:
+            pending.discard(idx)
+            async with lock:
+                plan = _plan_clip_unrendered(req.job_id, idx)
+                if plan:
+                    running.add(idx)
+                    job['result'] = _review_result(req.job_id)
+                job.setdefault('editor_active', set()).add(idx)
+                try:
+                    out = await _rerender_locked(req, request, job, plan=plan)
+                finally:
+                    running.discard(idx)
+                    job['editor_active'].discard(idx)
+    finally:
+        pending.discard(idx)
     if job.get('status') == 'review':
         result = _review_result(req.job_id)
         job['result'] = result
@@ -5846,8 +5885,22 @@ async def _rerender_locked(req: RerenderRequest, request: Request, job, plan=Fal
         clip.update(updates)
         if not hook:
             clip.pop('auto_hook', None)
-        data['shorts'] = clips
-        write_json_atomic(json_files[0], data, indent=2)
+        # Re-read: the render took minutes and other edits (AI texts, plan
+        # saves, new clips) may have landed meanwhile; write back only ours.
+        try:
+            with open(json_files[0], 'r', encoding='utf-8') as f:
+                fresh = json.load(f)
+        except (OSError, ValueError):
+            fresh = data
+        fresh_clips = fresh.get('shorts') or []
+        if req.clip_index < len(fresh_clips):
+            fresh_clip = fresh_clips[req.clip_index]
+            fresh_clip.update(updates)
+            if not hook:
+                fresh_clip.pop('auto_hook', None)
+        else:
+            fresh['shorts'] = clips
+        write_json_atomic(json_files[0], fresh, indent=2)
         mem_clips = (job.get('result') or {}).get('clips') or []
         if req.clip_index < len(mem_clips):
             mem_clips[req.clip_index].update(updates)

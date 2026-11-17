@@ -797,6 +797,16 @@ function App() {
         if (session.activeTab) setActiveTab(session.activeTab);
         // If was processing, resume polling; if complete/error, just show results
         setStatus(session.status === 'processing' ? 'processing' : session.status);
+        // The saved results are a snapshot; the server holds the current
+        // clips (texts written by the AI, renders finished meanwhile).
+        if (session.status === 'complete' || session.status === 'review') {
+          pollJob(session.jobId).then((data) => {
+            if (jobIdRef.current && jobIdRef.current !== session.jobId) return;
+            if (data?.result) setResults(data.result);
+            if (data?.status === 'review') setStatus('review');
+            else if (data?.status === 'completed') setStatus('complete');
+          }).catch(() => { /* keep the saved snapshot */ });
+        }
         setSessionRecovered(true);
         setTimeout(() => setSessionRecovered(false), 5000);
       }
@@ -2702,7 +2712,7 @@ function App() {
                               geminiKey={apiKey}
                               onResult={(result) => result && setResults(result)}
                               onEditClip={(index) => setEditingClip(index)}
-                              editorBusy={clipRenders[`${jobId}:${i}`]?.status === 'rendering'}
+                              editorBusy={['queued', 'rendering'].includes(clipRenders[`${jobId}:${i}`]?.status) ? clipRenders[`${jobId}:${i}`].status : false}
                             />
                           ) : null
                         ) : (

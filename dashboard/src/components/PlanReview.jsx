@@ -243,7 +243,7 @@ export function PlanCard({ clip, index, jobId, plan, geminiKey, onResult, onEdit
                 {queued && (
                     <div className="mb-3 px-3 py-2 rounded-input text-xs text-ink2 bg-paper3 flex items-center gap-2 lowercase">
                         <Loader2 size={14} className="shrink-0 animate-spin text-brass" />
-                        {state === 'rendering' || editorBusy ? 'rendering this clip…' : 'in line to render'}
+                        {state === 'rendering' || editorBusy === 'rendering' ? 'rendering this clip…' : 'in line to render'}
                     </div>
                 )}
                 {error && !editing && <p className="mb-3 text-xs text-danger">{error}</p>}

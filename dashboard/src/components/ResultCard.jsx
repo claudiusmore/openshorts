@@ -66,6 +66,7 @@ function formatDuration(clip) {
 
 export default function ResultCard({ clip, index, jobId, durable, uploadPostKey, uploadUserId, geminiApiKey, elevenLabsKey, isManaged, onPlay, onPause, onBulkSubtitle, clipCount = 1, bulkProgress, initialState = null, onStateChange, connectedPlatforms = null, onConnectSocials, onEditClip = null, onReframeClip = null, onUpgrade = null, renderState = null, onTextsUpdated = null }) {
     const [showModal, setShowModal] = useState(false);
+    const editBusy = renderState?.status === 'rendering' || renderState?.status === 'queued';
     // The "why" line is clamped to two lines so cards in a row stay level;
     // when it overflows, a hover (desktop) or tap (touch) shows the whole
     // sentence in a popover that floats over the card instead of growing it.
@@ -958,10 +959,12 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                     </div>
                 )}
 
-                {renderState?.status === 'rendering' && (
+                {(renderState?.status === 'rendering' || renderState?.status === 'queued') && (
                     <div className="mb-3 px-3 py-2 rounded-input text-xs text-ink2 bg-paper3 flex items-center gap-2 lowercase">
                         <Loader2 size={14} className="shrink-0 animate-spin text-brass" />
-                        rendering your edit in the background; this card updates when it finishes
+                        {renderState.status === 'queued'
+                            ? 'your edit is in line to render; this card updates when it finishes'
+                            : 'rendering your edit in the background; this card updates when it finishes'}
                     </div>
                 )}
                 {renderState?.status === 'error' && (
@@ -976,14 +979,14 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                     {onEditClip && (
                         <button
                             onClick={() => onEditClip(index)}
-                            disabled={renderState?.status === 'rendering'}
+                            disabled={editBusy}
                             className={QUIET_BTN}
                             title="cut, framing, captions, hook and music in one render"
                         >
-                            {renderState?.status === 'rendering'
+                            {editBusy
                                 ? <Loader2 size={16} className="animate-spin text-brass shrink-0" />
                                 : <Scissors size={16} className="text-muted group-hover:text-brass transition-colors shrink-0" />}
-                            {renderState?.status === 'rendering' ? 'rendering…' : 'edit'}
+                            {editBusy ? (renderState.status === 'queued' ? 'in line…' : 'rendering…') : 'edit'}
                         </button>
                     )}
 

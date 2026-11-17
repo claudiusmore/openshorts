@@ -2,7 +2,7 @@ import React, { useState, useEffect, useReducer, useRef, useCallback, useMemo, u
 import {
     X, Loader2, Plus, Trash2, ChevronUp, ChevronDown, Scissors,
     AlertCircle, Undo2, Redo2, ChevronsRight, ChevronsLeft,
-    PanelLeft, PanelLeftClose, Film, Type, Music, Crosshair, Wand2,
+    PanelLeft, PanelLeftClose, Film, Type, Music, Crosshair, Wand2, Search,
 } from 'lucide-react';
 import SubtitleModal from './SubtitleModal';
 import HookModal from './HookModal';
@@ -189,6 +189,7 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
     const [previewUrl, setPreviewUrl] = useState(null);
     const [rendering, setRendering] = useState(false);
     const [renderSeconds, setRenderSeconds] = useState(0);
+    const [renderQueued, setRenderQueued] = useState(false);
     const [renderError, setRenderError] = useState(null);
     const [confirmClose, setConfirmClose] = useState(false);
     const [selectedWord, setSelectedWord] = useState(null);
@@ -994,9 +995,24 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
         if (!canRender) return;
         setRendering(true);
         setRenderError(null);
-        onRenderState?.(clipIndex, { status: 'rendering' });
+        setRenderQueued(true);
+        onRenderState?.(clipIndex, { status: 'queued' });
         const sentMusic = { enabled: musicEnabled, volume: musicVolume };
         const sentCaptions = reapplyCaptions;
+        // The render waits in the same line as the grid's plan renders; the
+        // job status says when it is this clip's turn.
+        let lastState = 'queued';
+        const watch = setInterval(async () => {
+            try {
+                const st = await apiJson(`/api/status/${jobId}`);
+                const now = st?.renders?.[String(clipIndex)];
+                if (now && now !== lastState) {
+                    lastState = now;
+                    setRenderQueued(now === 'queued');
+                    onRenderState?.(clipIndex, { status: now });
+                }
+            } catch { /* keep the last state */ }
+        }, 2000);
         try {
             const res = await apiFetch('/api/clip/rerender', {
                 method: 'POST',
@@ -1049,7 +1065,9 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
                 setRenderError(e.message || 're-render failed');
             }
         } finally {
+            clearInterval(watch);
             setRendering(false);
+            setRenderQueued(false);
         }
     };
 
@@ -1119,6 +1137,48 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
         setSelectedWord((prev) => (prev && prev.s === w.s && prev.e === w.e ? null : w));
         seekSource(w.s);
     }, [seekSource]);
+
+    // ---- transcript search --------------------------------------------------
+    // Phrase match over the word list, case/accent/punctuation-insensitive.
+    // Each hit is the index of its first word; jumping to it selects that word
+    // so "#N starts here" works right away.
+    const [searchQuery, setSearchQuery] = useState('');
+    const [searchPos, setSearchPos] = useState(0);
+    const normWords = useMemo(() => words.map((w) => normalizeWord(w.w)), [words]);
+    const searchHits = useMemo(() => {
+        const terms = searchQuery.split(/\s+/).map(normalizeWord).filter(Boolean);
+        if (!terms.length) return { starts: [], len: 0 };
+        const out = [];
+        for (let i = 0; i + terms.length <= normWords.length; i++) {
+            let ok = true;
+            for (let k = 0; k < terms.length && ok; k++) {
+                const nw = normWords[i + k];
+                ok = k === terms.length - 1 ? nw.startsWith(terms[k]) : nw === terms[k];
+            }
+            if (ok) out.push(i);
+        }
+        return { starts: out, len: terms.length };
+    }, [searchQuery, normWords]);
+    const hitCount = searchHits.starts?.length || 0;
+    const hitSet = useMemo(() => {
+        const s = new Set();
+        (searchHits.starts || []).forEach((i) => {
+            for (let k = 0; k < searchHits.len; k++) s.add(i + k);
+        });
+        return s;
+    }, [searchHits]);
+
+    const goToHit = useCallback((pos) => {
+        if (!hitCount) return;
+        const p = ((pos % hitCount) + hitCount) % hitCount;
+        setSearchPos(p);
+        const w = words[searchHits.starts[p]];
+        setSelectedWord(w);
+        seekSource(w.s);
+        requestAnimationFrame(() => scrollTranscriptTo('[data-selected="1"]'));
+    }, [hitCount, searchHits, words, seekSource, scrollTranscriptTo]);
+
+    useEffect(() => { setSearchPos(0); }, [searchQuery]);
 
     // ---- render -------------------------------------------------------------
     if (loadError) {
@@ -1406,7 +1466,39 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
                         {/* transcript of the whole source */}
                         <div className="shrink-0 h-[30%] min-h-[9rem] flex flex-col">
                             <div className="flex items-center justify-between mb-1.5 gap-2 shrink-0">
-                                <p className="eyebrow">Transcript · full source</p>
+                                <p className="eyebrow shrink-0">Transcript · full source</p>
+                                {words.length > 0 && (
+                                    <div className="flex items-center gap-1 min-w-0 flex-1 justify-end">
+                                        <div className="relative min-w-0 w-40">
+                                            <Search size={11} className="absolute left-1.5 top-1/2 -translate-y-1/2 text-muted pointer-events-none" />
+                                            <input
+                                                type="text"
+                                                value={searchQuery}
+                                                onChange={(e) => setSearchQuery(e.target.value)}
+                                                onKeyDown={(e) => {
+                                                    e.stopPropagation();
+                                                    if (e.key === 'Enter') {
+                                                        e.preventDefault();
+                                                        goToHit(e.shiftKey ? searchPos - 1 : (selectedWord && words[searchHits.starts?.[searchPos]] === selectedWord ? searchPos + 1 : searchPos));
+                                                    } else if (e.key === 'Escape') {
+                                                        setSearchQuery('');
+                                                    }
+                                                }}
+                                                placeholder="search transcript"
+                                                className="w-full bg-paper2 border border-rule rounded text-[11px] py-1 pl-5 pr-1.5 text-ink placeholder:text-muted focus:outline-none focus:border-brass"
+                                            />
+                                        </div>
+                                        {searchQuery.trim() && (
+                                            <>
+                                                <span className="readout shrink-0 tabular-nums">
+                                                    {hitCount ? `${searchPos + 1}/${hitCount}` : '0/0'}
+                                                </span>
+                                                <button onClick={() => goToHit(searchPos - 1)} disabled={!hitCount} title="previous match (shift+enter)" className="btn-quiet p-1 disabled:opacity-40"><ChevronUp size={12} /></button>
+                                                <button onClick={() => goToHit(words[searchHits.starts?.[searchPos]] === selectedWord ? searchPos + 1 : searchPos)} disabled={!hitCount} title="next match (enter)" className="btn-quiet p-1 disabled:opacity-40"><ChevronDown size={12} /></button>
+                                            </>
+                                        )}
+                                    </div>
+                                )}
                                 {/* Boundary actions live HERE, above the words they
                                     act on, because this is where the eye is when
                                     picking a cut point from the text (issue #73). */}
@@ -1452,6 +1544,14 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
                                         const local = (idx) => (
                                             idx >= c.offset && idx < c.offset + c.items.length ? idx - c.offset : -1
                                         );
+                                        // Only chunks containing a match get a fresh value,
+                                        // so typing does not repaint the whole transcript.
+                                        let hits = NO_HITS;
+                                        if (hitSet.size) {
+                                            const h = [];
+                                            for (let k = 0; k < c.items.length; k++) if (hitSet.has(c.offset + k)) h.push(k);
+                                            if (h.length) hits = h.join(',');
+                                        }
                                         return (
                                             <TranscriptChunk
                                                 key={c.offset}
@@ -1461,6 +1561,7 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
                                                 active={local(activeWordIndex)}
                                                 anchorAt={local(anchorIndex)}
                                                 selectedAt={local(selectedWordIndex)}
+                                                hits={hits}
                                                 onPick={pickWord}
                                             />
                                         );
@@ -1847,7 +1948,7 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
                             </button>
                             <button className="btn-primary flex-1 flex items-center justify-center gap-2" disabled={!canRender || (!dirty && !planMode)} onClick={doRender}>
                                 {rendering
-                                    ? (<><Loader2 size={16} className="animate-spin text-brassink" /> re-rendering… {renderSeconds}s</>)
+                                    ? (<><Loader2 size={16} className="animate-spin text-brassink" /> {renderQueued ? 'in line to render…' : 're-rendering…'} {renderSeconds}s</>)
                                     : (planMode ? 'render short' : needsSourcePath ? 're-render from source' : 'render short')}
                             </button>
                         </div>
@@ -1906,6 +2007,12 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
 }
 
 
+const NO_HITS = '';
+
+function normalizeWord(s) {
+    return (s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+}
+
 // One slice of the transcript. Memoised because the whole transcript is on
 // screen: repainting a couple of thousand words costs ~66ms, and the source
 // monitor fires timeupdate about four times a second while it plays. Sliced,
@@ -1915,8 +2022,9 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
 // children of the scroll box — the flex-wrap layout and the anchor's offsetTop
 // both depend on that.
 const TranscriptChunk = React.memo(function TranscriptChunk({
-    items, offset, lit, active, anchorAt, selectedAt, onPick,
+    items, offset, lit, active, anchorAt, selectedAt, hits, onPick,
 }) {
+    const hitIdx = useMemo(() => new Set(hits ? hits.split(',').map(Number) : []), [hits]);
     return (
         <>
             {items.map((w, i) => {
@@ -1924,18 +2032,21 @@ const TranscriptChunk = React.memo(function TranscriptChunk({
                     || (lit !== 'none' && w.e > lit.start && w.s < lit.end);
                 const isActive = i === active;
                 const isSel = i === selectedAt;
+                const isHit = hitIdx.has(i);
                 return (
                     <button
                         key={`${w.s}-${offset + i}`}
                         data-anchor={i === anchorAt ? '1' : undefined}
                         data-active={isActive ? '1' : undefined}
+                        data-selected={isSel ? '1' : undefined}
                         onClick={() => onPick(w)}
                         title={`${fmt(w.s)} – ${fmt(w.e)}`}
                         className={`px-1 py-0.5 rounded text-xs transition-colors ${
                             isSel ? 'bg-brass text-brassink'
                                 : isActive ? 'bg-brass/30 text-ink'
-                                    : inside ? 'text-ink hover:bg-paper3'
-                                        : 'text-muted hover:bg-paper3'}`}
+                                    : isHit ? 'bg-brass/15 text-ink ring-1 ring-brass/60'
+                                        : inside ? 'text-ink hover:bg-paper3'
+                                            : 'text-muted hover:bg-paper3'}`}
                     >
                         {w.w}
                     </button>
