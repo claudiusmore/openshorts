@@ -137,7 +137,7 @@ TOOLS = [
                     "description": "Set true to proceed after a needs_confirmation low-resolution warning.",
                 },
                 "target_clips": {
-                    "type": "integer", "minimum": 1, "maximum": 15,
+                    "type": "integer", "minimum": 1,
                     "description": "How many clips to aim for. A target, not a guarantee: "
                                    "fewer come back when the material doesn't hold them. "
                                    "Default: the AI decides (usually 2-6).",

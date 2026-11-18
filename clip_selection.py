@@ -70,6 +70,70 @@ def clip_count_targets(n_windows):
     return low, max(low, high)
 
 
+def parse_clip_count_rules(raw):
+    """Validate the per-duration clip count table from Settings.
+
+    ``raw`` is a list (or its JSON) of ``{"up_to_minutes", "min", "max"}``;
+    an empty ``up_to_minutes`` is the catch-all row. Returns the rows sorted
+    by duration, catch-all last; raises ValueError on bad input."""
+    import json
+
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            raise ValueError("must be a JSON list")
+    if not isinstance(raw, list):
+        raise ValueError("must be a list")
+    rules = []
+    for row in raw:
+        if not isinstance(row, dict):
+            raise ValueError("each row must be an object")
+        up_to = row.get("up_to_minutes")
+        if up_to in (None, ""):
+            up_to = None
+        else:
+            try:
+                up_to = float(up_to)
+            except (TypeError, ValueError):
+                raise ValueError("up_to_minutes must be a number")
+            if up_to <= 0:
+                raise ValueError("up_to_minutes must be above 0")
+        try:
+            lo, hi = int(row.get("min")), int(row.get("max"))
+        except (TypeError, ValueError):
+            raise ValueError("min and max must be whole numbers")
+        if not (1 <= lo <= hi):
+            raise ValueError("need 1 <= min <= max")
+        rules.append({"up_to_minutes": up_to, "min": lo, "max": hi})
+    rules.sort(key=lambda r: (r["up_to_minutes"] is None, r["up_to_minutes"] or 0))
+    return rules
+
+
+def apply_clip_count_rules(video_duration, environ=None):
+    """Turn CLIP_COUNT_RULES into CLIP_TARGET_MIN/MAX for this video.
+
+    An explicit CLIP_TARGET_MIN/MAX (the per-video "clips to aim for") wins.
+    A video longer than every row with no catch-all keeps the automatic
+    targets. Returns the (min, max) applied, or None."""
+    import os
+
+    env = os.environ if environ is None else environ
+    raw = env.get("CLIP_COUNT_RULES")
+    if not raw or env.get("CLIP_TARGET_MIN") or env.get("CLIP_TARGET_MAX"):
+        return None
+    try:
+        rules = parse_clip_count_rules(raw)
+        minutes = float(video_duration or 0) / 60.0
+    except (TypeError, ValueError):
+        return None
+    for r in rules:
+        if r["up_to_minutes"] is None or minutes <= r["up_to_minutes"]:
+            env["CLIP_TARGET_MIN"], env["CLIP_TARGET_MAX"] = str(r["min"]), str(r["max"])
+            return r["min"], r["max"]
+    return None
+
+
 def shortlist_target(video_duration):
     """How many scored windows the detail pass should get.
 

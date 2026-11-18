@@ -82,3 +82,45 @@ class TestPromptTemplates:
             video_duration=100, language="es", windows_json="[]")
         assert "Score EVERY window" in text
         assert "up to 3 windows" not in text
+
+
+class TestClipCountRules:
+    RULES = [{"up_to_minutes": 15, "min": 6, "max": 10},
+             {"up_to_minutes": None, "min": 8, "max": 12},
+             {"up_to_minutes": "5", "min": "3", "max": "6"}]
+
+    def test_parse_sorts_with_catch_all_last(self):
+        rules = clip_selection.parse_clip_count_rules(self.RULES)
+        assert [r["up_to_minutes"] for r in rules] == [5.0, 15.0, None]
+        assert rules[0] == {"up_to_minutes": 5.0, "min": 3, "max": 6}
+
+    @pytest.mark.parametrize("bad", [
+        "not json", {"min": 1}, [{"up_to_minutes": 5, "min": 4, "max": 3}],
+        [{"up_to_minutes": 0, "min": 1, "max": 2}],
+    ])
+    def test_parse_rejects_bad_input(self, bad):
+        with pytest.raises(ValueError):
+            clip_selection.parse_clip_count_rules(bad)
+
+    @pytest.mark.parametrize("seconds, expected", [
+        (180, (3, 6)), (300, (3, 6)), (600, (6, 10)), (3600, (8, 12)),
+    ])
+    def test_apply_picks_the_first_row_that_fits(self, seconds, expected):
+        env = {"CLIP_COUNT_RULES": __import__("json").dumps(self.RULES)}
+        assert clip_selection.apply_clip_count_rules(seconds, env) == expected
+        assert (int(env["CLIP_TARGET_MIN"]), int(env["CLIP_TARGET_MAX"])) == expected
+
+    def test_apply_keeps_auto_past_the_last_row(self):
+        env = {"CLIP_COUNT_RULES": '[{"up_to_minutes": 5, "min": 3, "max": 6}]'}
+        assert clip_selection.apply_clip_count_rules(1200, env) is None
+        assert "CLIP_TARGET_MIN" not in env
+
+    def test_explicit_target_wins(self):
+        env = {"CLIP_COUNT_RULES": '[{"up_to_minutes": null, "min": 3, "max": 6}]',
+               "CLIP_TARGET_MIN": "4", "CLIP_TARGET_MAX": "4"}
+        assert clip_selection.apply_clip_count_rules(600, env) is None
+        assert env["CLIP_TARGET_MIN"] == "4"
+
+    def test_no_upper_limit_on_clip_count(self):
+        rules = clip_selection.parse_clip_count_rules([{"up_to_minutes": None, "min": 20, "max": 40}])
+        assert rules == [{"up_to_minutes": None, "min": 20, "max": 40}]

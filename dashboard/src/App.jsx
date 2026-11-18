@@ -36,6 +36,7 @@ import { useAuth } from './contexts/AuthContext';
 import { apiFetch, apiJson, QuotaError, QUOTA_WALL_EVENT } from './lib/api';
 import { track } from './lib/analytics';
 import { describeJobSettings } from './lib/jobSettings';
+import { DEFAULT_CLIP_COUNT_RULES, validateClipCountRules, savedClipCountRules, storeClipCountRules } from './lib/clipCountRules';
 
 // Enhanced "Encryption" using XOR + Base64 with a Salt
 // This is better than plain Base64 but still client-side.
@@ -318,6 +319,16 @@ function App() {
     return '';
   });
   const [groqSaved, setGroqSaved] = useState(false);
+
+  // Clips per video by source length (Settings). Empty = the automatic count.
+  const [clipCountRules, setClipCountRules] = useState(() => {
+    try {
+      const rows = JSON.parse(localStorage.getItem('os_clip_count_rules') || '[]');
+      return Array.isArray(rows) ? rows : [];
+    } catch { return []; }
+  });
+  const [clipRulesSaved, setClipRulesSaved] = useState(false);
+  const clipRulesError = validateClipCountRules(clipCountRules);
 
   // fal.ai API State - Load encrypted
   const [falKey, setFalKey] = useState(() => {
@@ -1293,6 +1304,9 @@ function App() {
         source_end: data.sourceEnd ?? null,
         // Stop after the AI picks the clips; render only what the user approves.
         review_first: data.reviewFirst ? '1' : null,
+        // The Settings table; a per-video "clips to aim for" overrides it.
+        clip_count_rules: !data.targetClips && savedClipCountRules().length
+          ? JSON.stringify(savedClipCountRules()) : null,
       };
 
       // A music file cannot ride JSON: a link with music goes multipart too.
@@ -1969,6 +1983,70 @@ function App() {
                   </div>
                 </div>
               )}
+
+              <div className="card p-4 sm:p-6 mt-8">
+                <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
+                  <h2 className="text-base font-medium text-ink lowercase">Clips per video</h2>
+                  <span className="readout">{clipCountRules.length ? 'by length' : 'auto'}</span>
+                </div>
+                <p className="text-xs text-muted mb-4 leading-relaxed">
+                  How many shorts the AI aims for, by the length of the source video. The first row the
+                  video fits in applies; leave &quot;up to&quot; empty for &quot;anything longer&quot;. Without rows
+                  (or for a video longer than every row) the count is automatic. A per-video
+                  &quot;clips to aim for&quot; in advanced options overrides this. Targets, not guarantees.
+                </p>
+                {clipCountRules.length > 0 && (
+                  <div className="space-y-2 mb-3">
+                    <div className="grid grid-cols-[1fr_1fr_1fr_auto] gap-2 text-[11px] text-muted lowercase">
+                      <span>video up to (min)</span><span>min clips</span><span>max clips</span><span className="w-7" />
+                    </div>
+                    {clipCountRules.map((row, i) => {
+                      const set = (key) => (e) => setClipCountRules((rows) =>
+                        rows.map((r, j) => (j === i ? { ...r, [key]: e.target.value } : r)));
+                      return (
+                        <div key={i} className="grid grid-cols-[1fr_1fr_1fr_auto] gap-2 items-center">
+                          <input type="number" min="1" step="1" value={row.up_to_minutes ?? ''}
+                            onChange={set('up_to_minutes')} placeholder="longer" className="input-field" />
+                          <input type="number" min="1" step="1" value={row.min}
+                            onChange={set('min')} className="input-field" />
+                          <input type="number" min="1" step="1" value={row.max}
+                            onChange={set('max')} className="input-field" />
+                          <button type="button" aria-label="remove row"
+                            onClick={() => setClipCountRules((rows) => rows.filter((_, j) => j !== i))}
+                            className="w-7 h-7 flex items-center justify-center text-muted hover:text-ink">
+                            <X size={14} />
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                {clipRulesError && <p className="text-xs text-red-500 mb-3">{clipRulesError}</p>}
+                <div className="flex flex-wrap gap-2">
+                  <button type="button" className="btn-quiet py-2 px-4 text-sm"
+                    onClick={() => setClipCountRules((rows) => (rows.length
+                      ? [...rows, { up_to_minutes: '', min: 3, max: 6 }]
+                      : DEFAULT_CLIP_COUNT_RULES.map((r) => ({ ...r }))))}>
+                    <Plus size={12} className="inline mr-1" />{clipCountRules.length ? 'add row' : 'set by length'}
+                  </button>
+                  {clipCountRules.length > 0 && (
+                    <button type="button" className="btn-quiet py-2 px-4 text-sm"
+                      onClick={() => setClipCountRules([])}>
+                      back to auto
+                    </button>
+                  )}
+                  <button type="button" disabled={!!clipRulesError}
+                    onClick={() => {
+                      storeClipCountRules(clipCountRules);
+                      setClipCountRules(savedClipCountRules().map((r) => ({ ...r, up_to_minutes: r.up_to_minutes ?? '' })));
+                      setClipRulesSaved(true);
+                      setTimeout(() => setClipRulesSaved(false), 2000);
+                    }}
+                    className={clipRulesSaved ? 'badge-ok px-4' : 'btn-quiet py-2 px-4 text-sm disabled:opacity-40'}>
+                    {clipRulesSaved ? <><Check size={12} /> saved</> : 'Save'}
+                  </button>
+                </div>
+              </div>
 
               <div className="card p-4 sm:p-6 mt-8">
                 <div className="flex flex-wrap items-center justify-between gap-2 mb-4">

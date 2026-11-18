@@ -31,7 +31,7 @@ import hook_grounding
 import layout_picker
 import llm_backend
 import twitch_signals
-from clip_selection import (build_transcript_windows, clip_count_targets,
+from clip_selection import (apply_clip_count_rules, build_transcript_windows, clip_count_targets,
                             clip_duration_bounds, dedupe_overlapping,
                             score_batches, shortlist_target,
                             snap_clip_to_words, trim_to_best,
@@ -2162,6 +2162,9 @@ def get_viral_clips(transcript_result, video_duration, viewer_clips=None):
         print(f"   Shortlisted {len(shortlist)} window(s) for detail.")
 
         # --- Pass 2: detailed clip extraction on the shortlist ---
+        if apply_clip_count_rules(video_duration):
+            print(f"   🎯 Clip count from Settings for this length: "
+                  f"{os.environ['CLIP_TARGET_MIN']}–{os.environ['CLIP_TARGET_MAX']}")
         min_clips, max_clips = clip_count_targets(len(shortlist))
 
         def _detail_prompt_for(lo, hi):
@@ -2412,6 +2415,7 @@ def get_visual_clips(video_path, video_duration, language="en", viewer_clips=Non
             return max(1, int(os.environ.get(name, "")))
         except ValueError:
             return default
+    apply_clip_count_rules(video_duration)
     v_min_clips = _env_int("CLIP_TARGET_MIN", 3)
     v_max_clips = max(v_min_clips, _env_int("CLIP_TARGET_MAX", 15))
     v_min_secs, v_max_secs = clip_duration_bounds()

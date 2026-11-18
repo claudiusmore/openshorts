@@ -37,6 +37,7 @@ from jsonfile import write_json_atomic
 import youtube_studio
 import youtube_queue
 import clip_texts
+from clip_selection import parse_clip_count_rules
 
 load_dotenv()
 
@@ -3876,6 +3877,7 @@ async def process_endpoint(
     music: Optional[UploadFile] = File(None),
     music_volume: Optional[str] = Form(None),
     review_first: Optional[str] = Form(None),
+    clip_count_rules: Optional[str] = Form(None),
 ):
     api_key = await resolve_gemini(request)
     if not api_key and not (llm_backend.active() and not BILLING_ENABLED):
@@ -3911,6 +3913,7 @@ async def process_endpoint(
         source_start = body.get("source_start")
         source_end = body.get("source_end")
         review_first = body.get("review_first")
+        clip_count_rules = body.get("clip_count_rules")
 
     # Normalize output format (auto = keep pipeline default).
     if output_format not in ("vertical", "horizontal", "square"):
@@ -4067,7 +4070,7 @@ async def process_endpoint(
                                 detail=f"{name} must be between {lo:g} and {hi:g}")
         return int(val) if integer else val
 
-    n_clips = _gen_control(target_clips, "target_clips", 1, 15, integer=True)
+    n_clips = _gen_control(target_clips, "target_clips", 1, float("inf"), integer=True)
     min_secs = _gen_control(clip_min_seconds, "clip_min_seconds", 5, 175)
     max_secs = _gen_control(clip_max_seconds, "clip_max_seconds", 10, 180)
     if min_secs is not None and max_secs is not None and max_secs < min_secs + 5:
@@ -4075,6 +4078,14 @@ async def process_endpoint(
                             detail="clip_max_seconds must be at least 5s above clip_min_seconds")
     if n_clips is not None:
         env["CLIP_TARGET_MIN"] = env["CLIP_TARGET_MAX"] = str(n_clips)
+    elif clip_count_rules not in (None, ""):
+        try:
+            rules = parse_clip_count_rules(clip_count_rules)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=f"clip_count_rules: {e}")
+        if rules:
+            env["CLIP_COUNT_RULES"] = json.dumps(rules)
+            print(f"[gen-controls] job={job_id} clip count rules={rules}")
     if min_secs is not None:
         env["CLIP_MIN_SECONDS"] = str(min_secs)
     if max_secs is not None:
@@ -4499,8 +4510,21 @@ def _review_result(job_id):
     clips = []
     for i, c in enumerate(data.get('shorts') or []):
         c = dict(c)
-        c.pop('video_url', None)
         name = ready.get(i) or _canonical_clip_file(job_dir, base, i)
+        # An editor re-render persists its file as video_url; it is the current
+        # version unless a later plan render rewrote the canonical file.
+        edited = os.path.basename(c.pop('video_url', None) or '')
+        if edited and i not in ready:
+            try:
+                edited_mtime = os.path.getmtime(os.path.join(job_dir, edited))
+                try:
+                    newer = edited_mtime >= os.path.getmtime(os.path.join(job_dir, name))
+                except OSError:
+                    newer = True
+                if newer:
+                    name = edited
+            except OSError:
+                pass
         # A clip still rendering has files on disk that ffmpeg is writing; only
         # the one announced by CLIP_READY (or left after the run) is playable.
         if i in running and i not in ready:
