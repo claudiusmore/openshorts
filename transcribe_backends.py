@@ -636,20 +636,23 @@ def _parakeet_fallback_reason(transcript, duration_hint=None):
 # Uploads are capped per file, so the audio goes up in mono mp3 chunks and
 # every timestamp is offset back to file time.
 #
-# Chunks are short (GROQ_CHUNK_SECONDS, ~140 s) and end in a pause. With 600 s
-# chunks, the segment right after every ~150 s inside a chunk came back broken
-# in every job: no punctuation and each word cut at its first accented letter
-# ("não" -> "n", "evolução" -> "evolu"). Groq recommends short segments for
-# long-form audio; each chunk gets the end of the previous one as its prompt
-# so the text stays continuous. Segments that still look like that are
-# transcribed again on their own (_groq_repair).
+# Chunks end in a pause and each gets the end of the previous one as its
+# prompt so the text stays continuous. Some segments come back from Groq with
+# no punctuation and each word cut at its first accented letter ("não" -> "n",
+# "evolução" -> "evolu"). Measured on Portuguese talks, the same segments
+# break with 140 s or 600 s chunks and with whisper-large-v3 as with the turbo
+# model, but come back right when sent on their own: _groq_repair does that.
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_DEFAULT_MODEL = "whisper-large-v3-turbo"
-GROQ_CHUNK_SECONDS = int(os.environ.get("GROQ_CHUNK_SECONDS", "140"))
+GROQ_CHUNK_SECONDS = int(os.environ.get("GROQ_CHUNK_SECONDS", "600"))
 # A cut goes in the last pause after this share of the chunk length.
 GROQ_MIN_CHUNK_SHARE = 0.6
 GROQ_PROMPT_CHARS = 200
+# Repairs hit the key's rate limit on long videos (one per ~2-3 min of speech):
+# pause and go on, up to this much waiting in total per job.
+GROQ_REPAIR_PAUSE = 30
+GROQ_REPAIR_MAX_WAIT = int(os.environ.get("GROQ_REPAIR_MAX_WAIT", "900"))
 
 # Groq reports the language by name ("Portuguese"); the pipeline wants ISO codes.
 _WHISPER_LANGUAGE_CODES = {
@@ -856,7 +859,7 @@ def _groq_repair(media_path, workdir, transcript, api_key, model):
     suspects = [i for i, s in enumerate(segs) if _groq_suspect(s["text"], lang)]
     if suspects:
         print(f"🩹 [ASR] groq: re-transcribing {len(suspects)} broken segment(s)…")
-    fixed = 0
+    fixed = waited = 0
     for done, i in enumerate(reversed(suspects)):
         if done and done % 10 == 0:
             print(f"🩹 [ASR] groq: repaired {done}/{len(suspects)}…")
@@ -872,11 +875,20 @@ def _groq_repair(media_path, workdir, transcript, api_key, model):
                  "-b:a", "64k", path], check=True, stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE, timeout=120)
             prompt = _tail(" ".join(s["text"].strip() for s in segs[max(0, i - 3):i]))
-            data = _groq_request(path, api_key, model, attempts=2, prompt=prompt, language=lang)
+            while True:
+                try:
+                    data = _groq_request(path, api_key, model, attempts=2, prompt=prompt, language=lang)
+                    break
+                except GroqRateLimited:
+                    if waited >= GROQ_REPAIR_MAX_WAIT:
+                        raise
+                    print(f"⏳ [ASR] groq rate limit; waiting {GROQ_REPAIR_PAUSE}s "
+                          f"before repair {done + 1}/{len(suspects)}")
+                    time.sleep(GROQ_REPAIR_PAUSE)
+                    waited += GROQ_REPAIR_PAUSE
         except GroqRateLimited:
-            # The key's quota is spent; every later request would fail the same
-            # way, so keep the rest of the text as transcribed.
-            print(f"⚠️ [ASR] groq rate limit reached; skipping the remaining "
+            # Waited as long as allowed; keep the rest of the text as transcribed.
+            print(f"⚠️ [ASR] groq rate limit persists; skipping the remaining "
                   f"{len(suspects) - done} repair(s)")
             break
         except Exception as e:

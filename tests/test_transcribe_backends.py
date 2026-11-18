@@ -578,9 +578,32 @@ def test_groq_repair_stops_at_the_rate_limit(monkeypatch, tmp_path):
         calls.append(1)
         raise tb.GroqRateLimited("groq 429")
     monkeypatch.setattr(tb, "_groq_request", limited)
+    monkeypatch.setattr(tb, "GROQ_REPAIR_MAX_WAIT", 60)
+    slept = []
+    monkeypatch.setattr(tb.time, "sleep", slept.append)
     out = tb._groq_repair("a.mp4", str(tmp_path), t, "k", "m")
-    assert len(calls) == 1
+    assert slept == [30, 30]          # waits up to the budget, then gives up
+    assert len(calls) == 3
     assert [s["text"] for s in out["segments"]] == [broken] * 5
+
+
+def test_groq_repair_waits_out_a_rate_limit(monkeypatch, tmp_path):
+    broken = " mude por evolu N vamos evoluir Se n tiver isso n evolui"
+    t = {"text": "", "language": "pt",
+         "segments": [{"start": 0.0, "end": 8.0, "text": broken, "words": []}]}
+    monkeypatch.setattr(tb.subprocess, "run", lambda *a, **k: None)
+    monkeypatch.setattr(tb.time, "sleep", lambda s: None)
+    answers = iter([tb.GroqRateLimited("groq 429"), None])
+
+    def flaky(*a, **k):
+        err = next(answers)
+        if err:
+            raise err
+        return {"segments": [{"start": 0.0, "end": 8.0, "text": " Mude por evolução. Não vamos parar."}],
+                "words": []}
+    monkeypatch.setattr(tb, "_groq_request", flaky)
+    out = tb._groq_repair("a.mp4", str(tmp_path), t, "k", "m")
+    assert out["segments"][0]["text"] == " Mude por evolução. Não vamos parar."
 
 
 def test_transcribe_media_groq_falls_back_to_whisper(monkeypatch):
