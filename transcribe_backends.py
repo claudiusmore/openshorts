@@ -633,12 +633,23 @@ def _parakeet_fallback_reason(transcript, duration_hint=None):
 # TRANSCRIBE_BACKEND=groq sends the audio to Groq's hosted Whisper
 # (whisper-large-v3-turbo by default, GROQ_API_KEY required). On a CPU-only
 # host this turns most of an hour of local transcription into a minute or two.
-# Uploads are capped per file, so the audio goes up in GROQ_CHUNK_SECONDS mono
-# mp3 chunks and every timestamp is offset back to file time.
+# Uploads are capped per file, so the audio goes up in mono mp3 chunks and
+# every timestamp is offset back to file time.
+#
+# Chunks are short (GROQ_CHUNK_SECONDS, ~140 s) and end in a pause. With 600 s
+# chunks, the segment right after every ~150 s inside a chunk came back broken
+# in every job: no punctuation and each word cut at its first accented letter
+# ("não" -> "n", "evolução" -> "evolu"). Groq recommends short segments for
+# long-form audio; each chunk gets the end of the previous one as its prompt
+# so the text stays continuous. Segments that still look like that are
+# transcribed again on their own (_groq_repair).
 
 GROQ_API_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 GROQ_DEFAULT_MODEL = "whisper-large-v3-turbo"
-GROQ_CHUNK_SECONDS = int(os.environ.get("GROQ_CHUNK_SECONDS", "600"))
+GROQ_CHUNK_SECONDS = int(os.environ.get("GROQ_CHUNK_SECONDS", "140"))
+# A cut goes in the last pause after this share of the chunk length.
+GROQ_MIN_CHUNK_SHARE = 0.6
+GROQ_PROMPT_CHARS = 200
 
 # Groq reports the language by name ("Portuguese"); the pipeline wants ISO codes.
 _WHISPER_LANGUAGE_CODES = {
@@ -652,35 +663,90 @@ _WHISPER_LANGUAGE_CODES = {
 }
 
 
+# Latin-script languages whose normal speech is full of accented letters: a
+# long segment in one of them with no accent and no punctuation is the broken
+# decode described above.
+_ACCENTED_LANGS = {"pt", "es", "fr", "de", "it", "ca", "ro", "pl", "cs", "sk", "hu",
+                   "tr", "sv", "da", "no", "fi", "hr", "sl", "lv", "lt", "et", "vi"}
+
+
+def _groq_language_code(name):
+    name = str(name or "").strip().lower()
+    return _WHISPER_LANGUAGE_CODES.get(name) or (name if len(name) == 2 else None)
+
+
+def _media_duration(path):
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "csv=p=0", path], capture_output=True, text=True, timeout=60)
+    try:
+        return float(probe.stdout.strip())
+    except ValueError:
+        return None
+
+
+def _pauses(media_path, noise_db=-35, min_seconds=0.3):
+    """Midpoints of the pauses in the audio (ffmpeg silencedetect)."""
+    proc = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-nostats", "-i", media_path, "-vn", "-ac", "1",
+         "-af", f"silencedetect=noise={noise_db}dB:d={min_seconds}", "-f", "null", "-"],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=1800)
+    starts = [float(x) for x in re.findall(r"silence_start: (-?[\d.]+)", proc.stderr)]
+    ends = [float(x) for x in re.findall(r"silence_end: (-?[\d.]+)", proc.stderr)]
+    return [(max(0.0, a) + b) / 2 for a, b in zip(starts, ends)]
+
+
+def _plan_cuts(duration, pauses, chunk_seconds):
+    """Cut points so no chunk exceeds chunk_seconds, each in a pause if possible."""
+    cuts, pos = [], 0.0
+    while duration - pos > chunk_seconds:
+        lo, hi = pos + chunk_seconds * GROQ_MIN_CHUNK_SHARE, pos + chunk_seconds
+        inside = [p for p in pauses if lo <= p <= hi]
+        cut = round(inside[-1] if inside else hi, 3)
+        cuts.append(cut)
+        pos = cut
+    return cuts
+
+
 def _groq_chunks(media_path, workdir, chunk_seconds=None):
     """Split the audio into mono mp3 chunks; returns ``[(offset_seconds, path)]``.
 
-    Offsets come from each chunk's probed duration, not ``i * chunk_seconds``:
-    the segment muxer cuts on frame boundaries, so the nominal value drifts."""
+    Offsets come from each chunk's probed duration: the segment muxer cuts on
+    frame boundaries, so the planned cut points drift a little."""
     chunk_seconds = chunk_seconds or GROQ_CHUNK_SECONDS
+    duration = _media_duration(media_path) or 0.0
+    cuts = _plan_cuts(duration, _pauses(media_path), chunk_seconds) if duration > chunk_seconds else []
     pattern = os.path.join(workdir, "chunk_%04d.mp3")
-    subprocess.run(
-        ["ffmpeg", "-y", "-loglevel", "error", "-i", media_path, "-vn", "-ac", "1",
-         "-ar", "16000", "-c:a", "libmp3lame", "-b:a", "64k", "-f", "segment",
-         "-segment_time", str(chunk_seconds), "-reset_timestamps", "1", pattern],
-        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=1800)
+    cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", media_path, "-vn", "-ac", "1",
+           "-ar", "16000", "-c:a", "libmp3lame", "-b:a", "64k", "-f", "segment"]
+    if cuts:
+        cmd += ["-segment_times", ",".join(str(c) for c in cuts)]
+    else:
+        cmd += ["-segment_time", str(max(chunk_seconds, int(duration) + 1))]
+    subprocess.run(cmd + ["-reset_timestamps", "1", pattern],
+                   check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=1800)
     chunks, offset = [], 0.0
-    for name in sorted(os.listdir(workdir)):
+    for name in sorted(n for n in os.listdir(workdir) if n.startswith("chunk_")):
         path = os.path.join(workdir, name)
         chunks.append((offset, path))
-        probe = subprocess.run(
-            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-             "-of", "csv=p=0", path], capture_output=True, text=True, timeout=60)
-        offset += float(probe.stdout.strip() or chunk_seconds)
+        offset += _media_duration(path) or chunk_seconds
     return chunks
 
 
-def _groq_request(path, api_key, model, attempts=4):
+class GroqRateLimited(RuntimeError):
+    """Groq kept answering 429 after every retry (key quota used up)."""
+
+
+def _groq_request(path, api_key, model, attempts=4, prompt=None, language=None):
     """One verbose_json transcription with word + segment timestamps."""
     import httpx
 
     data = {"model": model, "response_format": "verbose_json", "temperature": "0",
             "timestamp_granularities[]": ["word", "segment"]}
+    if prompt:
+        data["prompt"] = prompt
+    if language:
+        data["language"] = language
     for attempt in range(1, attempts + 1):
         with open(path, "rb") as fh:
             resp = httpx.post(
@@ -697,7 +763,8 @@ def _groq_request(path, api_key, model, attempts=4):
             print(f"⚠️ [ASR] groq {resp.status_code}, retrying in {wait:.0f}s")
             time.sleep(wait)
             continue
-        raise RuntimeError(f"groq {resp.status_code}: {resp.text[:300]}")
+        error = GroqRateLimited if resp.status_code == 429 else RuntimeError
+        raise error(f"groq {resp.status_code}: {resp.text[:300]}")
 
 
 def _groq_segment_words(seg_text, raw_words, offset):
@@ -717,20 +784,42 @@ def _groq_segment_words(seg_text, raw_words, offset):
     return words
 
 
+def _monotonic_words(raw):
+    """Groq's words in the order they were said, with times that never go back.
+
+    Sorting by start reordered the text whenever Groq timed a word too early
+    ("superar de a morte" for "superar a morte de"); the order is the reliable
+    part, so keep it and pull such a time forward instead."""
+    out, last = [], 0.0
+    for w in raw:
+        start = max(float(w["start"]), last)
+        out.append({**w, "start": start, "end": max(float(w["end"]), start)})
+        last = start
+    return out
+
+
 def _groq_transcript(results):
     """Merge ``[(offset, verbose_json)]`` chunk results into the transcript contract."""
     segments, language = [], None
     for offset, data in results:
         language = language or str(data.get("language") or "").strip().lower()
-        words = sorted(data.get("words") or [], key=lambda w: w["start"])
+        words = _monotonic_words(data.get("words") or [])
         chunk_segments = [s for s in data.get("segments") or [] if (s.get("text") or "").strip()]
+        # When the segment texts hold as many tokens as there are words, hand
+        # the words out by count (text order); otherwise by time.
+        counts = [len(s["text"].split()) for s in chunk_segments]
+        by_count = sum(counts) == len(words)
         wi = 0
         for n, s in enumerate(chunk_segments):
             last = n == len(chunk_segments) - 1
-            raw = []
-            while wi < len(words) and (last or (words[wi]["start"] + words[wi]["end"]) / 2 <= s["end"]):
-                raw.append(words[wi])
-                wi += 1
+            if by_count:
+                raw = words[wi:wi + counts[n]]
+                wi += counts[n]
+            else:
+                raw = []
+                while wi < len(words) and (last or (words[wi]["start"] + words[wi]["end"]) / 2 <= s["end"]):
+                    raw.append(words[wi])
+                    wi += 1
             text = s["text"].strip()
             segments.append({
                 "start": float(offset + s["start"]),
@@ -739,9 +828,69 @@ def _groq_transcript(results):
                 "words": _groq_segment_words(text, raw, offset),
             })
     full_text = " ".join(s["text"].strip() for s in segments)
-    code = _WHISPER_LANGUAGE_CODES.get(language) or (
-        language if language and len(language) == 2 else _detect_language(full_text))
+    code = _groq_language_code(language) or _detect_language(full_text)
     return {"text": full_text, "language": code, "segments": segments}
+
+
+def _groq_suspect(text, language):
+    """The broken decode: a long segment with no accent and no punctuation."""
+    text = (text or "").strip()
+    if language not in _ACCENTED_LANGS or len(text.split()) < 8:
+        return False
+    return not re.search(r"[^\x00-\x7f]", text) and not re.search(r"[.,!?;:…]", text)
+
+
+def _tail(text, chars=GROQ_PROMPT_CHARS):
+    """The end of a text, cut on a word boundary (Whisper prompt)."""
+    text = (text or "").strip()
+    if len(text) <= chars:
+        return text or None
+    cut = text[-chars:]
+    return cut[cut.find(" ") + 1:] if " " in cut else cut
+
+
+def _groq_repair(media_path, workdir, transcript, api_key, model):
+    """Transcribe each broken-looking segment again, on its own window."""
+    segs = transcript["segments"]
+    lang = transcript["language"]
+    suspects = [i for i, s in enumerate(segs) if _groq_suspect(s["text"], lang)]
+    if suspects:
+        print(f"🩹 [ASR] groq: re-transcribing {len(suspects)} broken segment(s)…")
+    fixed = 0
+    for done, i in enumerate(reversed(suspects)):
+        if done and done % 10 == 0:
+            print(f"🩹 [ASR] groq: repaired {done}/{len(suspects)}…")
+        seg = segs[i]
+        start = max(segs[i - 1]["end"] if i else 0.0, seg["start"] - 0.3)
+        nxt = segs[i + 1]["start"] if i + 1 < len(segs) else seg["end"] + 0.3
+        end = max(seg["end"], min(nxt, seg["end"] + 0.3))
+        path = os.path.join(workdir, f"repair_{i:05d}.mp3")
+        try:
+            subprocess.run(
+                ["ffmpeg", "-y", "-loglevel", "error", "-ss", f"{start:.3f}", "-t", f"{end - start:.3f}",
+                 "-i", media_path, "-vn", "-ac", "1", "-ar", "16000", "-c:a", "libmp3lame",
+                 "-b:a", "64k", path], check=True, stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE, timeout=120)
+            prompt = _tail(" ".join(s["text"].strip() for s in segs[max(0, i - 3):i]))
+            data = _groq_request(path, api_key, model, attempts=2, prompt=prompt, language=lang)
+        except GroqRateLimited:
+            # The key's quota is spent; every later request would fail the same
+            # way, so keep the rest of the text as transcribed.
+            print(f"⚠️ [ASR] groq rate limit reached; skipping the remaining "
+                  f"{len(suspects) - done} repair(s)")
+            break
+        except Exception as e:
+            print(f"⚠️ [ASR] groq repair at {seg['start']:.0f}s failed: {e}")
+            continue
+        new = _groq_transcript([(start, data)])["segments"]
+        if not new or _groq_suspect(" ".join(s["text"] for s in new), lang):
+            continue
+        segs[i:i + 1] = new
+        fixed += 1
+    if suspects:
+        print(f"🩹 [ASR] groq: re-transcribed {fixed}/{len(suspects)} broken segment(s)")
+    transcript["text"] = " ".join(s["text"].strip() for s in segs)
+    return transcript
 
 
 def _transcribe_with_groq(media_path):
@@ -752,12 +901,15 @@ def _transcribe_with_groq(media_path):
     started = time.time()
     with tempfile.TemporaryDirectory(prefix="asr_groq_") as workdir:
         chunks = _groq_chunks(media_path, workdir)
-        results = []
+        results, prompt, language = [], None, None
         for i, (offset, path) in enumerate(chunks, 1):
-            results.append((offset, _groq_request(path, api_key, model)))
+            data = _groq_request(path, api_key, model, prompt=prompt, language=language)
+            results.append((offset, data))
+            language = language or _groq_language_code(data.get("language"))
+            prompt = _tail(" ".join((s.get("text") or "").strip() for s in data.get("segments") or []))
             print(f"🎙️ Transcribing… {round(100 * i / len(chunks))}% "
                   f"({time.time() - started:.0f}s) [groq]")
-    return _groq_transcript(results)
+        return _groq_repair(media_path, workdir, _groq_transcript(results), api_key, model)
 
 
 # --- public entry point -----------------------------------------------------

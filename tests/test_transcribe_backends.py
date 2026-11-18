@@ -510,6 +510,79 @@ def test_groq_transcript_assigns_words_by_midpoint_and_keeps_leftovers():
     assert t["language"] == "en"
 
 
+def test_groq_plan_cuts_prefers_last_pause_in_window():
+    # 140 s chunks: the window for the first cut is 84..140 s.
+    cuts = tb._plan_cuts(400.0, [50.0, 100.0, 130.0, 150.0, 260.0], 140)
+    assert cuts[0] == 130.0          # last pause inside 84..140
+    assert cuts[1] == 260.0          # inside 214..270
+    assert all(b - a <= 140 for a, b in zip([0.0] + cuts, cuts + [400.0]))
+    # No pause in the window: hard cut at the limit.
+    assert tb._plan_cuts(300.0, [], 140) == [140.0, 280.0]
+    assert tb._plan_cuts(100.0, [50.0], 140) == []
+
+
+def test_groq_transcript_keeps_text_order_when_a_word_is_timed_early():
+    data = _groq_chunk(
+        "Portuguese",
+        [{"start": 0.0, "end": 2.1, "text": " superar a morte"},
+         {"start": 2.1, "end": 3.0, "text": " de um ente"}],
+        # Groq times "de" before "a morte"; sorting by start used to move it.
+        [{"word": "superar", "start": 0.0, "end": 0.5}, {"word": "a", "start": 1.6, "end": 1.7},
+         {"word": "morte", "start": 1.8, "end": 2.1}, {"word": "de", "start": 1.5, "end": 1.6},
+         {"word": "um", "start": 2.2, "end": 2.3}, {"word": "ente", "start": 2.4, "end": 2.8}],
+    )
+    t = tb._groq_transcript([(0.0, data)])
+    assert [w["word"] for w in t["segments"][0]["words"]] == [" superar", " a", " morte"]
+    assert [w["word"] for w in t["segments"][1]["words"]] == [" de", " um", " ente"]
+    starts = [w["start"] for s in t["segments"] for w in s["words"]]
+    assert starts == sorted(starts)
+
+
+def test_groq_suspect_flags_the_broken_decode_only():
+    broken = "mude por evolu N vamos evoluir Se n tiver isso n evolui Fa uma compara"
+    assert tb._groq_suspect(broken, "pt")
+    assert not tb._groq_suspect("Mude por evolução. Não vamos parar se não tiver isso", "pt")
+    assert not tb._groq_suspect(broken, "en")          # English has no accents to lose
+    assert not tb._groq_suspect("curto demais sem nada", "pt")
+
+
+def test_groq_repair_replaces_only_a_fixed_segment(monkeypatch, tmp_path):
+    good = {"start": 0.0, "end": 5.0, "text": " Tudo certo aqui.", "words": []}
+    broken = {"start": 5.0, "end": 12.0,
+              "text": " mude por evolu N vamos evoluir Se n tiver isso n evolui", "words": []}
+    t = {"text": "", "language": "pt", "segments": [good, broken]}
+    calls = []
+    monkeypatch.setattr(tb.subprocess, "run", lambda *a, **k: None)
+
+    def fake_request(path, key, model, attempts=4, prompt=None, language=None):
+        calls.append((prompt, language))
+        return {"language": "portuguese",
+                "segments": [{"start": 0.0, "end": 7.0, "text": " Mude por evolução. Não vamos parar."}],
+                "words": []}
+    monkeypatch.setattr(tb, "_groq_request", fake_request)
+    out = tb._groq_repair("a.mp4", str(tmp_path), t, "k", "m")
+    assert calls == [("Tudo certo aqui.", "pt")]
+    assert [s["text"] for s in out["segments"]] == [" Tudo certo aqui.", " Mude por evolução. Não vamos parar."]
+    assert out["segments"][1]["start"] == pytest.approx(5.0)   # window starts at the previous end
+    assert out["text"] == "Tudo certo aqui. Mude por evolução. Não vamos parar."
+
+
+def test_groq_repair_stops_at_the_rate_limit(monkeypatch, tmp_path):
+    broken = " mude por evolu N vamos evoluir Se n tiver isso n evolui"
+    segs = [{"start": 10.0 * i, "end": 10.0 * i + 8, "text": broken, "words": []} for i in range(5)]
+    t = {"text": "", "language": "pt", "segments": segs}
+    calls = []
+    monkeypatch.setattr(tb.subprocess, "run", lambda *a, **k: None)
+
+    def limited(*a, **k):
+        calls.append(1)
+        raise tb.GroqRateLimited("groq 429")
+    monkeypatch.setattr(tb, "_groq_request", limited)
+    out = tb._groq_repair("a.mp4", str(tmp_path), t, "k", "m")
+    assert len(calls) == 1
+    assert [s["text"] for s in out["segments"]] == [broken] * 5
+
+
 def test_transcribe_media_groq_falls_back_to_whisper(monkeypatch):
     monkeypatch.setenv("TRANSCRIBE_BACKEND", "groq")
     monkeypatch.setattr(tb, "_has_audio_stream", lambda p: True)
