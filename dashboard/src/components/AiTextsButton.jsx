@@ -4,13 +4,14 @@ import { postPlan } from '../lib/plan';
 
 // Asks the AI to rewrite the clip's hook, title, descriptions, why and score
 // from what is said inside its current cut.
-export default function AiTextsButton({ jobId, index, geminiKey, onResult, className, disabled = false, rendered = false }) {
+export default function AiTextsButton({ jobId, index, geminiKey, onResult, className, disabled = false, rendered = false, segments = null }) {
     const [busy, setBusy] = useState(false);
     const run = async () => {
         setBusy(true);
         try {
-            const data = await postPlan(`/api/clip/${jobId}/${index}/texts`, {}, geminiKey);
-            onResult?.(data.result);
+            const data = await postPlan(`/api/clip/${jobId}/${index}/texts`,
+                segments ? { segments: segments.map((s) => ({ start: s.start, end: s.end })) } : {}, geminiKey);
+            onResult?.(data.result, data.texts);
         } catch (e) {
             alert(e.message);
         } finally {

@@ -6,6 +6,7 @@ import {
 } from 'lucide-react';
 import SubtitleModal from './SubtitleModal';
 import HookModal from './HookModal';
+import AiTextsButton from './AiTextsButton';
 import { PlanOverlay } from './PlanReview';
 import { getApiUrl, withParam } from '../config';
 import { apiFetch, apiJson, QuotaError, openQuotaWall } from '../lib/api';
@@ -161,7 +162,7 @@ function editorReducer(state, action) {
     }
 }
 
-export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRerendered, onRenderState, onOpenReframe }) {
+export default function ClipEditor({ jobId, clipIndex, clipTitle, geminiKey, onTextsUpdated, onClose, onRerendered, onRenderState, onOpenReframe }) {
     const { refreshMe } = useAuth();
     const [edl, setEdl] = useState(null);
     const [loadError, setLoadError] = useState(null);
@@ -177,6 +178,7 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
     const [captionDraft, setCaptionDraft] = useState(null);
     const [captionDraftCut, setCaptionDraftCut] = useState('');
     const [hookDraft, setHookDraft] = useState(undefined);
+    const [aiTitle, setAiTitle] = useState(null);
     const [musicEnabled, setMusicEnabled] = useState(true);
     const [musicVolume, setMusicVolume] = useState(0.15);
     const [showCaptionModal, setShowCaptionModal] = useState(false);
@@ -320,8 +322,13 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
     // one; once the cut changed that file no longer matches, so the layers are
     // previewed over black on the new timeline.
     const cutChanged = cutKey(segments) !== cutKey(renderedSegments);
-    const previewBase = edl && !cutChanged
-        ? getApiUrl(`/videos/${jobId}/${stripBurns(edl.current_file)}`) : '';
+    // Not rendered yet (or cut changed): the source from the cut's first
+    // segment, so the layers show over real footage instead of black.
+    const previewFromSource = !!edl && (planMode || cutChanged) && !!edl.source?.url && segments.length > 0;
+    const previewBase = !edl ? ''
+        : previewFromSource ? getApiUrl(edl.source.url)
+            : !cutChanged ? getApiUrl(`/videos/${jobId}/${stripBurns(edl.current_file)}`) : '';
+    const previewStart = previewFromSource ? segments[0].start : 0;
     const hookPreview = currentHook?.text ? {
         text: currentHook.text, position: currentHook.position === 'auto' ? 'top' : (currentHook.position || 'top'),
         size: currentHook.size || 'M', style: currentHook.style || 'pill', font: currentHook.font,
@@ -1850,6 +1857,37 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
                             )}
                         </div>
 
+                        {/* texts: written by the AI from the words of the cut on screen */}
+                        <div>
+                            <p className="eyebrow mb-2 flex items-center gap-1.5"><Type size={12} /> Texts</p>
+                            <p className="text-xs text-ink2 break-words">
+                                {(aiTitle ?? clipTitle) || <span className="text-muted">no title</span>}
+                            </p>
+                            <AiTextsButton
+                                jobId={jobId}
+                                index={clipIndex}
+                                geminiKey={geminiKey}
+                                segments={segments}
+                                disabled={rendering || !segments.length}
+                                rendered={!planMode}
+                                onResult={(result, texts) => {
+                                    onTextsUpdated?.(result);
+                                    if (!texts) return;
+                                    setAiTitle(texts.video_title_for_youtube_short || '');
+                                    if (texts.viral_hook_text) {
+                                        setHookDraft({
+                                            style: 'pill', position: 'auto', size: 'M', duration_seconds: 5,
+                                            ...(currentHook || {}), text: texts.viral_hook_text,
+                                        });
+                                    }
+                                }}
+                                className="group w-full mt-2 py-1.5 rounded-input border border-rule2 text-xs lowercase text-ink2 hover:bg-paper3 transition-colors flex items-center justify-center gap-1.5 disabled:opacity-45"
+                            />
+                            <p className="text-[11px] text-muted mt-1.5 leading-relaxed">
+                                hook, title, descriptions and why from the text of this cut only
+                            </p>
+                        </div>
+
                         {/* hook */}
                         <div>
                             <p className="eyebrow mb-2 flex items-center gap-1.5"><Wand2 size={12} /> Hook</p>
@@ -1973,6 +2011,7 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
                     }}
                     isProcessing={false}
                     videoUrl={previewBase}
+                    videoStartSec={previewStart}
                     jobId={jobId}
                     clipIndex={clipIndex}
                     captionsOverride={{ captions: cutCaptions(words, segments), durationSec: total }}
@@ -1995,6 +2034,7 @@ export default function ClipEditor({ jobId, clipIndex, clipTitle, onClose, onRer
                     }}
                     isProcessing={false}
                     videoUrl={previewBase}
+                    videoStartSec={previewStart}
                     initialText={currentHook?.text}
                     initial={currentHook}
                     durationInSeconds={total}

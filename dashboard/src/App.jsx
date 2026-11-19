@@ -2801,7 +2801,6 @@ function App() {
                           jobId={jobId}
                           onEditClip={(index) => setEditingClip(index)}
                           onReframeClip={(index) => setReframingClip(index)}
-                          onTextsUpdated={(result) => result && setResults(result)}
                           renderState={clipRenders[`${jobId}:${i}`] || null}
                           onUpgrade={isManaged ? openUpsell : null}
                           initialState={projectState?.clips?.find((c) => c.index === i) || null}
@@ -2990,6 +2989,10 @@ function App() {
           jobId={jobId}
           clipIndex={editingClip}
           clipTitle={results.clips[editingClip].video_title_for_youtube_short || ''}
+          geminiKey={apiKey}
+          onTextsUpdated={((forJob) => (result) => {
+            if (result && jobIdRef.current === forJob) setResults(result);
+          })(jobId)}
           onClose={() => setEditingClip(null)}
           onRerendered={((forJob) => (index, data) => {
             // The render may land after the user moved to another project.

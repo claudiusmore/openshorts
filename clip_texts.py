@@ -49,12 +49,16 @@ def clip_transcript(segments, start, end):
     return " ".join(t for t in out if t)
 
 
-def generate(segments, start, end, video_title="", gemini_key: Optional[str] = None) -> dict:
-    text = clip_transcript(segments, start, end)
+def generate(segments, start, end, video_title="", gemini_key: Optional[str] = None,
+             spans=None) -> dict:
+    """spans: the cut's (start, end) pieces in order, when it has more than
+    one or differs from start/end."""
+    spans = spans or [(start, end)]
+    text = " ".join(t for t in (clip_transcript(segments, s, e) for s, e in spans) if t)
     if not text:
         raise ValueError("Nothing is said inside this cut")
-    prompt = PROMPT.format(video_title=video_title or "-", start=start, end=end,
-                           length=end - start, text=text)
+    prompt = PROMPT.format(video_title=video_title or "-", start=spans[0][0], end=spans[-1][1],
+                           length=sum(e - s for s, e in spans), text=text)
     if llm_backend.active():
         data, _ = llm_backend.generate_json(prompt, ClipTexts)
     else:

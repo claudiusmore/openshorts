@@ -11,7 +11,7 @@ import { VideoEffects } from "./VideoEffects";
  * Uses @remotion/media Video for browser-side rendering compatibility.
  */
 export const ShortVideo: React.FC<Record<string, unknown>> = (rawProps) => {
-  const { videoUrl, subtitles, hook, effects } =
+  const { videoUrl, videoStartSec, fps, subtitles, hook, effects } =
     rawProps as unknown as ShortVideoProps;
   return (
     <AbsoluteFill style={{ backgroundColor: "#000" }}>
@@ -22,6 +22,7 @@ export const ShortVideo: React.FC<Record<string, unknown>> = (rawProps) => {
         <VideoEffects config={effects}>
           <Video
             src={videoUrl}
+            trimBefore={videoStartSec ? Math.round(videoStartSec * fps) : undefined}
             style={{ width: "100%", height: "100%", objectFit: "cover" }}
           />
         </VideoEffects>

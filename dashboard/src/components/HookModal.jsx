@@ -60,7 +60,7 @@ function loadHookPrefs() {
 // `initial` (the clip editor): the hook the clip already carries, so the form
 // opens on it. `submitLabel` + `onTop` let the editor use this as a step of
 // its single render instead of an immediate one.
-export default function HookModal({ isOpen, onClose, onGenerate, onRemove, isProcessing, videoUrl, initialText, durationInSeconds, existingSubtitles, hasCaptions, serverRender, burnedHook, initial = null, submitLabel = null, onTop = false }) {
+export default function HookModal({ isOpen, onClose, onGenerate, onRemove, isProcessing, videoUrl, videoStartSec = 0, initialText, durationInSeconds, existingSubtitles, hasCaptions, serverRender, burnedHook, initial = null, submitLabel = null, onTop = false }) {
     const prefs = { ...loadHookPrefs(), ...(initial ? {
         pos: initial.position, size: initial.size, style: initial.style, font: initial.font,
     } : {}) };
@@ -120,6 +120,7 @@ export default function HookModal({ isOpen, onClose, onGenerate, onRemove, isPro
                     {useRemotionPreview ? (
                         <RemotionPreview
                             videoUrl={videoUrl}
+                            videoStartSec={videoStartSec}
                             durationInSeconds={durationInSeconds || 30}
                             hook={hookConfig}
                             subtitles={existingSubtitles || null}

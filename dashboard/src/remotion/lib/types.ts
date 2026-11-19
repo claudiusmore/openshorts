@@ -88,6 +88,9 @@ export interface EffectsConfig {
 // --- Main composition props ---
 export interface ShortVideoProps {
   videoUrl: string;
+  // Seconds into videoUrl where the short starts (the source of a clip that
+  // is not rendered yet).
+  videoStartSec?: number;
   durationInFrames: number;
   fps: number;
   width: number;
@@ -151,6 +154,7 @@ export const effectsConfigSchema = z.object({
 
 export const shortVideoPropsSchema = z.object({
   videoUrl: z.string(),
+  videoStartSec: z.number().min(0).optional(),
   durationInFrames: z.number().int().positive(),
   fps: z.number().positive(),
   width: z.number().int().positive(),

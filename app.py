@@ -4759,11 +4759,24 @@ async def regenerate_clip_texts(job_id: str, clip_index: int, request: Request):
     shown = shown[clip_index] if clip_index < len(shown) else {}
     start = float(shown.get('start', shorts[clip_index].get('start')) or 0)
     end = float(shown.get('end', shorts[clip_index].get('end')) or 0)
+    # The editor sends the cut on screen, which may not be saved yet.
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    spans = None
+    if isinstance(body, dict) and body.get('segments'):
+        try:
+            spans = [(float(s['start']), float(s['end'])) for s in body['segments']]
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="segments: need start/end numbers")
+        if any(e <= s for s, e in spans):
+            raise HTTPException(status_code=400, detail="segments: end must be after start")
     title = os.path.basename(metas[0])[:-len("_metadata.json")]
     try:
         texts = await asyncio.to_thread(
             clip_texts.generate, (data.get('transcript') or {}).get('segments'),
-            start, end, title, await resolve_gemini(request))
+            start, end, title, await resolve_gemini(request), spans)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:

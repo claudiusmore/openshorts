@@ -115,7 +115,7 @@ const swatchClass = (selected) =>
         ? 'ring-2 ring-[color:var(--color-accent)] ring-offset-2 ring-offset-[color:var(--color-paper-2)]'
         : 'ring-1 ring-[color:var(--color-rule-2)] hover:ring-[color:var(--color-accent)]'}`;
 
-export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll, onRemove, isProcessing, videoUrl, jobId, clipIndex, existingHook, bulkCount = 0, bulkProgress, submitLabel = null, onTop = false, captionsOverride = null }) {
+export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll, onRemove, isProcessing, videoUrl, videoStartSec = 0, jobId, clipIndex, existingHook, bulkCount = 0, bulkProgress, submitLabel = null, onTop = false, captionsOverride = null }) {
     // Opens on the look the clip already has (the Default preset), so
     // "apply" without touching anything changes nothing.
     const [position, setPosition] = useState('bottom');
@@ -290,6 +290,7 @@ export default function SubtitleModal({ isOpen, onClose, onGenerate, onApplyAll,
                     ) : useRemotionPreview ? (
                         <RemotionPreview
                             videoUrl={videoUrl}
+                            videoStartSec={videoStartSec}
                             durationInSeconds={durationSec}
                             subtitles={subtitleConfig}
                             hook={existingHook || null}

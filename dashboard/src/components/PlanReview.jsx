@@ -3,7 +3,6 @@ import { Loader2, Scissors, Clapperboard, TrendingUp, AlertCircle, FileText, Pen
 import { TEXT_FIELDS, editsOf, postPlan } from '../lib/plan';
 import { getApiUrl } from '../config';
 import Modal from './ui/Modal';
-import AiTextsButton from './AiTextsButton';
 
 // Review step of a job created with "review before rendering": the AI picked
 // the clips but they are not rendered yet. Each one shows as a card like the
@@ -248,7 +247,7 @@ export function PlanCard({ clip, index, jobId, plan, geminiKey, onResult, onEdit
                 )}
                 {error && !editing && <p className="mb-3 text-xs text-danger">{error}</p>}
 
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-auto pt-4 border-t border-rule">
+                <div className="grid grid-cols-3 gap-2 mt-auto pt-4 border-t border-rule">
                     <button
                         type="button"
                         onClick={() => onEditClip(index)}
@@ -263,7 +262,6 @@ export function PlanCard({ clip, index, jobId, plan, geminiKey, onResult, onEdit
                         <PenLine size={16} className="text-muted group-hover:text-brass transition-colors shrink-0" />
                         texts &amp; ai cut
                     </button>
-                    <AiTextsButton jobId={jobId} index={index} geminiKey={geminiKey} onResult={onResult} disabled={queued} className={QUIET_BTN} />
                     <button
                         type="button"
                         onClick={() => submit(true, clip)}

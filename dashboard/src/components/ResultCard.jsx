@@ -10,7 +10,6 @@ import Modal from './ui/Modal';
 import SegmentedControl from './ui/SegmentedControl';
 import WatermarkModal, { watermarkNoticeDismissed } from './WatermarkModal';
 import TikTokDraftNotice from './TikTokDraftNotice';
-import AiTextsButton from './AiTextsButton';
 import { useAuth } from '../contexts/AuthContext';
 import { renderInBrowser } from '../lib/renderInBrowser';
 
@@ -64,7 +63,7 @@ function formatDuration(clip) {
     return `${String(Math.floor(secs / 60)).padStart(2, '0')}:${String(secs % 60).padStart(2, '0')}`;
 }
 
-export default function ResultCard({ clip, index, jobId, durable, uploadPostKey, uploadUserId, geminiApiKey, elevenLabsKey, isManaged, onPlay, onPause, onBulkSubtitle, clipCount = 1, bulkProgress, initialState = null, onStateChange, connectedPlatforms = null, onConnectSocials, onEditClip = null, onReframeClip = null, onUpgrade = null, renderState = null, onTextsUpdated = null }) {
+export default function ResultCard({ clip, index, jobId, durable, uploadPostKey, uploadUserId, geminiApiKey, elevenLabsKey, isManaged, onPlay, onPause, onBulkSubtitle, clipCount = 1, bulkProgress, initialState = null, onStateChange, connectedPlatforms = null, onConnectSocials, onEditClip = null, onReframeClip = null, onUpgrade = null, renderState = null }) {
     const [showModal, setShowModal] = useState(false);
     const editBusy = renderState?.status === 'rendering' || renderState?.status === 'queued';
     // The "why" line is clamped to two lines so cards in a row stay level;
@@ -988,10 +987,6 @@ export default function ResultCard({ clip, index, jobId, durable, uploadPostKey,
                                 : <Scissors size={16} className="text-muted group-hover:text-brass transition-colors shrink-0" />}
                             {editBusy ? (renderState.status === 'queued' ? 'in line…' : 'rendering…') : 'edit'}
                         </button>
-                    )}
-
-                    {onTextsUpdated && (
-                        <AiTextsButton jobId={jobId} index={index} geminiKey={geminiApiKey} onResult={onTextsUpdated} rendered className={QUIET_BTN} />
                     )}
 
                     {/* With the editor, framing/captions/hook live inside it. */}
